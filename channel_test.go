@@ -145,7 +145,7 @@ func TestNewID_format(t *testing.T) {
 		t.Errorf("newID() length = %d, want 32", len(id))
 	}
 	for _, c := range id {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("newID() contains non-hex char %q in %q", c, id)
 		}
 	}
@@ -202,7 +202,7 @@ func TestConnect_withQueryToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	// Send a message and verify it arrives in inbox with correct token.
 	frame := inboundFrame{Content: "hello"}
@@ -244,7 +244,7 @@ func TestConnect_withBearerHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() with Bearer header = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	frame := inboundFrame{Content: "hi"}
 	data, _ := json.Marshal(frame)
@@ -287,7 +287,7 @@ func TestSend_deliversToClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	// Get the conversation ID assigned to this connection.
 	frame := inboundFrame{Content: "ping"}

@@ -41,7 +41,7 @@ func run() int {
 	defer stop()
 
 	if err := channel.Serve(ctx, ch); err != nil && ctx.Err() == nil {
-		os.Stderr.WriteString("channel serve: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("channel serve: " + err.Error() + "\n")
 		return 1
 	}
 	return 0
