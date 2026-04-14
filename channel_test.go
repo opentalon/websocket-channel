@@ -338,7 +338,7 @@ func TestInbound_withFileAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	fileBytes := []byte("col1,col2\n1,2\n3,4")
 	frame := inboundFrame{
@@ -388,7 +388,7 @@ func TestInbound_emptyFrame_skipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	empty := inboundFrame{}
 	data, _ := json.Marshal(empty)
@@ -414,7 +414,7 @@ func TestConversationID_uniquePerConnection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Dial() = %v", err)
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		data, _ := json.Marshal(inboundFrame{Content: "hi"})
 		_ = conn.Write(ctx, websocket.MessageText, data)
 		select {
