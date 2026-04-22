@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"strings"
 
-	wschannel "github.com/opentalon/websocket-channel"
+	wschannel "github.com/opentalon/websocket-channel/channel"
 	"github.com/opentalon/opentalon/pkg/channel"
 )
 
