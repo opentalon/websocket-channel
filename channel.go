@@ -34,11 +34,13 @@ type wsConn struct {
 // Channel is a WebSocket server channel. Browser clients connect to it with a
 // profile token and exchange JSON text frames with the OpenTalon core.
 type Channel struct {
-	cfg   Config
-	conns sync.Map // conversationID → *wsConn
-	inbox chan<- pkg.InboundMessage
-	srv   *http.Server
-	wg    sync.WaitGroup
+	cfg     Config
+	conns   sync.Map // conversationID → *wsConn
+	inbox   chan<- pkg.InboundMessage
+	srv     *http.Server
+	stopMu  sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
 }
 
 // inboundFrame is the JSON structure for client → server messages.
@@ -168,6 +170,9 @@ func (c *Channel) Stop() error {
 		defer cancel()
 		_ = c.srv.Shutdown(ctx)
 	}
+	c.stopMu.Lock()
+	c.stopped = true
+	c.stopMu.Unlock()
 	c.wg.Wait()
 	return nil
 }
@@ -202,7 +207,15 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	cn := &wsConn{ws: ws}
 	c.conns.Store(convID, cn)
 
+	c.stopMu.Lock()
+	if c.stopped {
+		c.stopMu.Unlock()
+		c.conns.Delete(convID)
+		_ = ws.CloseNow()
+		return
+	}
 	c.wg.Add(1)
+	c.stopMu.Unlock()
 	defer func() {
 		c.wg.Done()
 		c.conns.Delete(convID)
