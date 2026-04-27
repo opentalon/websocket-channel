@@ -59,6 +59,8 @@ type fileFrame struct {
 type outboundFrame struct {
 	ConversationID string `json:"conversation_id"`
 	Content        string `json:"content"`
+	Streaming      bool   `json:"streaming,omitempty"` // true while LLM is still generating; false (or absent) = final message
+	Done           bool   `json:"done,omitempty"`      // true on the last streaming frame
 }
 
 // New returns a Channel with the given default config.
@@ -104,7 +106,7 @@ func (c *Channel) Capabilities() pkg.Capabilities {
 		Files:            true,
 		Threads:          false,
 		Reactions:        false,
-		Edits:            false,
+		Edits:            true,
 		MaxMessageLength: 64 * 1024,
 		ResponseFormat:   pkg.FormatHTML,
 	}
@@ -153,6 +155,58 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 	frame := outboundFrame{
 		ConversationID: msg.ConversationID,
 		Content:        msg.Content,
+	}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("marshal response: %w", err)
+	}
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	return cn.ws.Write(ctx, websocket.MessageText, data)
+}
+
+// SendAndCapture implements pkg.UpdatableChannel. For WebSocket, the
+// conversation ID is the message identifier (there's only one active
+// message per connection at a time).
+func (c *Channel) SendAndCapture(ctx context.Context, msg pkg.OutboundMessage) (string, error) {
+	v, ok := c.conns.Load(msg.ConversationID)
+	if !ok {
+		return "", nil
+	}
+	cn := v.(*wsConn)
+	frame := outboundFrame{
+		ConversationID: msg.ConversationID,
+		Content:        msg.Content,
+		Streaming:      true,
+	}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		return "", fmt.Errorf("marshal response: %w", err)
+	}
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	if err := cn.ws.Write(ctx, websocket.MessageText, data); err != nil {
+		return "", err
+	}
+	return msg.ConversationID, nil
+}
+
+// SendUpdate implements pkg.UpdatableChannel. It sends a streaming update
+// frame to the WebSocket client. The client should replace its current
+// message content with the new content.
+func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.OutboundMessage) error {
+	v, ok := c.conns.Load(messageID)
+	if !ok {
+		return nil
+	}
+	cn := v.(*wsConn)
+	// Detect if this is the final frame: no typing cursor means done.
+	isDone := !strings.HasSuffix(msg.Content, "\u25CD")
+	frame := outboundFrame{
+		ConversationID: messageID,
+		Content:        msg.Content,
+		Streaming:      !isDone,
+		Done:           isDone,
 	}
 	data, err := json.Marshal(frame)
 	if err != nil {
