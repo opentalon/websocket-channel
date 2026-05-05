@@ -106,7 +106,7 @@ func (c *Channel) Capabilities() pkg.Capabilities {
 		Files:            true,
 		Threads:          false,
 		Reactions:        false,
-		Edits:            false,
+		Edits:            true,
 		MaxMessageLength: 64 * 1024,
 		ResponseFormat:   pkg.FormatHTML,
 	}
@@ -166,47 +166,33 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 }
 
 // SendAndCapture implements pkg.UpdatableChannel. For WebSocket, the
-// conversation ID is the message identifier (there's only one active
-// message per connection at a time).
-func (c *Channel) SendAndCapture(ctx context.Context, msg pkg.OutboundMessage) (string, error) {
-	v, ok := c.conns.Load(msg.ConversationID)
-	if !ok {
-		return "", nil
-	}
-	cn := v.(*wsConn)
-	frame := outboundFrame{
-		ConversationID: msg.ConversationID,
-		Content:        msg.Content,
-		Streaming:      true,
-	}
-	data, err := json.Marshal(frame)
-	if err != nil {
-		return "", fmt.Errorf("marshal response: %w", err)
-	}
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-	if err := cn.ws.Write(ctx, websocket.MessageText, data); err != nil {
-		return "", err
-	}
+// conversation ID is the message identifier. We suppress the initial
+// streaming frame — only the final update (via SendUpdate) is sent
+// to avoid showing hallucinated intermediate text to the user.
+func (c *Channel) SendAndCapture(_ context.Context, msg pkg.OutboundMessage) (string, error) {
+	// Don't send the initial frame — wait for the final SendUpdate.
 	return msg.ConversationID, nil
 }
 
-// SendUpdate implements pkg.UpdatableChannel. It sends a streaming update
-// frame to the WebSocket client. The client should replace its current
-// message content with the new content.
+// SendUpdate implements pkg.UpdatableChannel. Only the final frame
+// (no typing cursor) is sent to the client. Intermediate streaming
+// updates are suppressed to avoid showing partial/hallucinated text.
 func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.OutboundMessage) error {
+	// Only send the final frame — skip intermediate streaming updates.
+	isDone := !strings.HasSuffix(msg.Content, "\u25CD")
+	if !isDone {
+		return nil // suppress intermediate frame
+	}
+
 	v, ok := c.conns.Load(messageID)
 	if !ok {
 		return nil
 	}
 	cn := v.(*wsConn)
-	// Detect if this is the final frame: no typing cursor means done.
-	isDone := !strings.HasSuffix(msg.Content, "\u25CD")
 	frame := outboundFrame{
 		ConversationID: messageID,
 		Content:        msg.Content,
-		Streaming:      !isDone,
-		Done:           isDone,
+		Done:           true,
 	}
 	data, err := json.Marshal(frame)
 	if err != nil {
