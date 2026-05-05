@@ -106,7 +106,7 @@ func (c *Channel) Capabilities() pkg.Capabilities {
 		Files:            true,
 		Threads:          false,
 		Reactions:        false,
-		Edits:            true,
+		Edits:            false,
 		MaxMessageLength: 64 * 1024,
 		ResponseFormat:   pkg.FormatHTML,
 	}
