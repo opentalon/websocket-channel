@@ -71,8 +71,8 @@ func TestCapabilities(t *testing.T) {
 	if caps.Reactions {
 		t.Error("Capabilities().Reactions should be false")
 	}
-	if caps.Edits {
-		t.Error("Capabilities().Edits should be false")
+	if !caps.Edits {
+		t.Error("Capabilities().Edits should be true")
 	}
 	if caps.MaxMessageLength != 64*1024 {
 		t.Errorf("Capabilities().MaxMessageLength = %d, want %d", caps.MaxMessageLength, 64*1024)
