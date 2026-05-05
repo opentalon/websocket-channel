@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/coder/websocket v1.8.14
-	github.com/opentalon/opentalon v0.0.13-0.20260505160549-e6b24896b274
+	github.com/opentalon/opentalon v0.0.13
 )
 
 require (
