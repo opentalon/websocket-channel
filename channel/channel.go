@@ -27,9 +27,8 @@ type Config struct {
 }
 
 type wsConn struct {
-	ws   *websocket.Conn
-	mu   sync.Mutex
-	sent bool // true after the first final frame was sent
+	ws *websocket.Conn
+	mu sync.Mutex
 }
 
 // Channel is a WebSocket server channel. Browser clients connect to it with a
@@ -166,50 +165,18 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 	return cn.ws.Write(ctx, websocket.MessageText, data)
 }
 
-// SendAndCapture implements pkg.UpdatableChannel. For WebSocket, the
-// conversation ID is the message identifier. We suppress the initial
-// streaming frame — only the final update (via SendUpdate) is sent
-// to avoid showing hallucinated intermediate text to the user.
-func (c *Channel) SendAndCapture(_ context.Context, msg pkg.OutboundMessage) (string, error) {
-	// Don't send the initial frame — wait for the final SendUpdate.
-	return msg.ConversationID, nil
+// SendAndCapture implements pkg.UpdatableChannel. Returns an error so
+// the StreamWriter never sets flushed=true. This makes registry.go
+// fall through to ch.Send() with the clean final response — the user
+// only sees one frame with the correct answer, no intermediate flicker.
+func (c *Channel) SendAndCapture(_ context.Context, _ pkg.OutboundMessage) (string, error) {
+	return "", fmt.Errorf("websocket: streaming suppressed")
 }
 
-// SendUpdate implements pkg.UpdatableChannel. All frames are suppressed
-// except the very last one. The StreamWriter sends a "done" flush (no cursor)
-// followed by FinalUpdate (clean response). We skip the first and send
-// the second — the user only sees the clean final response.
-func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.OutboundMessage) error {
-	// Skip intermediate frames (have typing cursor).
-	if strings.HasSuffix(msg.Content, "\u25CD") {
-		return nil
-	}
-
-	v, ok := c.conns.Load(messageID)
-	if !ok {
-		return nil
-	}
-	cn := v.(*wsConn)
-
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-
-	// Skip the first "done" flush — wait for FinalUpdate which has the clean response.
-	if !cn.sent {
-		cn.sent = true
-		return nil
-	}
-
-	frame := outboundFrame{
-		ConversationID: messageID,
-		Content:        msg.Content,
-		Done:           true,
-	}
-	data, err := json.Marshal(frame)
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
-	}
-	return cn.ws.Write(ctx, websocket.MessageText, data)
+// SendUpdate implements pkg.UpdatableChannel. No-op because SendAndCapture
+// returns an error, so the StreamWriter never has a messageID to update.
+func (c *Channel) SendUpdate(_ context.Context, _ string, _ pkg.OutboundMessage) error {
+	return nil
 }
 
 // Stop implements pkg.Channel.
