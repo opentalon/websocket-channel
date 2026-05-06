@@ -108,7 +108,10 @@ func (c *Channel) Capabilities() pkg.Capabilities {
 		Reactions:        false,
 		Edits:            true,
 		MaxMessageLength: 64 * 1024,
-		ResponseFormat:   pkg.FormatHTML,
+		// Markdown instead of HTML: the HTML format hint in the system prompt
+		// prevents weak LLMs (e.g. gpt-oss-120b) from producing [tool_call]
+		// blocks. The frontend converts markdown to HTML with a JS library.
+		ResponseFormat: pkg.FormatMarkdown,
 	}
 }
 

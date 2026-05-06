@@ -77,8 +77,8 @@ func TestCapabilities(t *testing.T) {
 	if caps.MaxMessageLength != 64*1024 {
 		t.Errorf("Capabilities().MaxMessageLength = %d, want %d", caps.MaxMessageLength, 64*1024)
 	}
-	if caps.ResponseFormat != pkg.FormatHTML {
-		t.Errorf("Capabilities().ResponseFormat = %q, want %q", caps.ResponseFormat, pkg.FormatHTML)
+	if caps.ResponseFormat != pkg.FormatMarkdown {
+		t.Errorf("Capabilities().ResponseFormat = %q, want %q", caps.ResponseFormat, pkg.FormatMarkdown)
 	}
 }
 
