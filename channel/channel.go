@@ -147,6 +147,7 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 // Send implements pkg.Channel. It delivers a response to the WebSocket client
 // identified by msg.ConversationID. Safe for concurrent use.
 func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
+	slog.Debug("websocket Send", "conv", msg.ConversationID, "content_len", len(msg.Content))
 	v, ok := c.conns.Load(msg.ConversationID)
 	if !ok {
 		return nil // client already disconnected
@@ -169,13 +170,15 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 // the StreamWriter never sets flushed=true. This makes registry.go
 // fall through to ch.Send() with the clean final response — the user
 // only sees one frame with the correct answer, no intermediate flicker.
-func (c *Channel) SendAndCapture(_ context.Context, _ pkg.OutboundMessage) (string, error) {
+func (c *Channel) SendAndCapture(_ context.Context, msg pkg.OutboundMessage) (string, error) {
+	slog.Debug("websocket SendAndCapture suppressed", "conv", msg.ConversationID, "content_len", len(msg.Content))
 	return "", fmt.Errorf("websocket: streaming suppressed")
 }
 
 // SendUpdate implements pkg.UpdatableChannel. No-op because SendAndCapture
 // returns an error, so the StreamWriter never has a messageID to update.
-func (c *Channel) SendUpdate(_ context.Context, _ string, _ pkg.OutboundMessage) error {
+func (c *Channel) SendUpdate(_ context.Context, msgID string, msg pkg.OutboundMessage) error {
+	slog.Debug("websocket SendUpdate suppressed", "msgID", msgID, "content_len", len(msg.Content))
 	return nil
 }
 
