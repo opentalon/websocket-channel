@@ -27,8 +27,9 @@ type Config struct {
 }
 
 type wsConn struct {
-	ws *websocket.Conn
-	mu sync.Mutex
+	ws   *websocket.Conn
+	mu   sync.Mutex
+	sent bool // true after the first final frame was sent
 }
 
 // Channel is a WebSocket server channel. Browser clients connect to it with a
@@ -174,14 +175,14 @@ func (c *Channel) SendAndCapture(_ context.Context, msg pkg.OutboundMessage) (st
 	return msg.ConversationID, nil
 }
 
-// SendUpdate implements pkg.UpdatableChannel. Only the final frame
-// (no typing cursor) is sent to the client. Intermediate streaming
-// updates are suppressed to avoid showing partial/hallucinated text.
+// SendUpdate implements pkg.UpdatableChannel. All frames are suppressed
+// except the very last one. The StreamWriter sends a "done" flush (no cursor)
+// followed by FinalUpdate (clean response). We skip the first and send
+// the second — the user only sees the clean final response.
 func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.OutboundMessage) error {
-	// Only send the final frame — skip intermediate streaming updates.
-	isDone := !strings.HasSuffix(msg.Content, "\u25CD")
-	if !isDone {
-		return nil // suppress intermediate frame
+	// Skip intermediate frames (have typing cursor).
+	if strings.HasSuffix(msg.Content, "\u25CD") {
+		return nil
 	}
 
 	v, ok := c.conns.Load(messageID)
@@ -189,6 +190,16 @@ func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.Outb
 		return nil
 	}
 	cn := v.(*wsConn)
+
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+
+	// Skip the first "done" flush — wait for FinalUpdate which has the clean response.
+	if !cn.sent {
+		cn.sent = true
+		return nil
+	}
+
 	frame := outboundFrame{
 		ConversationID: messageID,
 		Content:        msg.Content,
@@ -198,8 +209,6 @@ func (c *Channel) SendUpdate(ctx context.Context, messageID string, msg pkg.Outb
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
 	return cn.ws.Write(ctx, websocket.MessageText, data)
 }
 
