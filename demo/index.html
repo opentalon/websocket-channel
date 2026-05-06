@@ -460,7 +460,7 @@
   function appendAssistant(html) {
     const div = document.createElement('div');
     div.className = 'msg assistant';
-    div.innerHTML = html; // server sends HTML (FormatHTML)
+    div.innerHTML = html; // server sends Markdown (FormatMarkdown) — convert with marked.js or similar
     messages.insertBefore(div, typing);
     scrollToBottom();
   }
