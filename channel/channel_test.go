@@ -327,6 +327,54 @@ func TestSend_deliversToClient(t *testing.T) {
 	}
 }
 
+func TestSend_typingIndicator(t *testing.T) {
+	ch, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL(srv, "tok"), nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	// Get conversation ID.
+	data, _ := json.Marshal(inboundFrame{Content: "hi"})
+	_ = conn.Write(ctx, websocket.MessageText, data)
+	var convID string
+	select {
+	case msg := <-inbox:
+		convID = msg.ConversationID
+	case <-ctx.Done():
+		t.Fatal("timed out")
+	}
+
+	// Send a typing indicator.
+	if err := ch.Send(ctx, pkg.OutboundMessage{
+		ConversationID: convID,
+		Metadata:       map[string]string{"_typing": "true"},
+	}); err != nil {
+		t.Fatalf("Send typing = %v", err)
+	}
+
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read() = %v", err)
+	}
+	var out outboundFrame
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !out.Typing {
+		t.Error("expected typing=true in frame")
+	}
+	if out.Content != "" {
+		t.Errorf("typing frame should have empty content, got %q", out.Content)
+	}
+}
+
 func TestInbound_withFileAttachment(t *testing.T) {
 	_, inbox, srv, cleanup := testServer(t)
 	defer cleanup()

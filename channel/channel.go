@@ -61,6 +61,7 @@ type outboundFrame struct {
 	Content        string `json:"content"`
 	Streaming      bool   `json:"streaming,omitempty"` // true while LLM is still generating; false (or absent) = final message
 	Done           bool   `json:"done,omitempty"`      // true on the last streaming frame
+	Typing         bool   `json:"typing,omitempty"`    // true for keepalive typing-indicator frames (no content)
 }
 
 // New returns a Channel with the given default config.
@@ -150,7 +151,8 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 // Send implements pkg.Channel. It delivers a response to the WebSocket client
 // identified by msg.ConversationID. Safe for concurrent use.
 func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
-	slog.Debug("websocket Send", "conv", msg.ConversationID, "content_len", len(msg.Content))
+	typing := msg.Metadata["_typing"] == "true"
+	slog.Debug("websocket Send", "conv", msg.ConversationID, "content_len", len(msg.Content), "typing", typing)
 	v, ok := c.conns.Load(msg.ConversationID)
 	if !ok {
 		return nil // client already disconnected
@@ -159,6 +161,7 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 	frame := outboundFrame{
 		ConversationID: msg.ConversationID,
 		Content:        msg.Content,
+		Typing:         typing,
 	}
 	data, err := json.Marshal(frame)
 	if err != nil {
