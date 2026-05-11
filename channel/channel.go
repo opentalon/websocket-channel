@@ -57,11 +57,12 @@ type fileFrame struct {
 
 // outboundFrame is the JSON structure for server → client messages.
 type outboundFrame struct {
-	ConversationID string `json:"conversation_id"`
-	Content        string `json:"content"`
-	Streaming      bool   `json:"streaming,omitempty"` // true while LLM is still generating; false (or absent) = final message
-	Done           bool   `json:"done,omitempty"`      // true on the last streaming frame
-	Typing         bool   `json:"typing,omitempty"`    // true for keepalive typing-indicator frames (no content)
+	ConversationID string            `json:"conversation_id"`
+	Content        string            `json:"content"`
+	Metadata       map[string]string `json:"metadata,omitempty"` // pass-through from core (e.g. type=confirmation, options=approve,reject)
+	Streaming      bool              `json:"streaming,omitempty"` // true while LLM is still generating; false (or absent) = final message
+	Done           bool              `json:"done,omitempty"`      // true on the last streaming frame
+	Typing         bool              `json:"typing,omitempty"`    // true for keepalive typing-indicator frames (no content)
 }
 
 // New returns a Channel with the given default config.
@@ -158,9 +159,21 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 		return nil // client already disconnected
 	}
 	cn := v.(*wsConn)
+	// Filter out internal metadata keys before forwarding to the client.
+	var meta map[string]string
+	for k, v := range msg.Metadata {
+		if k == "_typing" || k == "profile_token" {
+			continue
+		}
+		if meta == nil {
+			meta = make(map[string]string, len(msg.Metadata))
+		}
+		meta[k] = v
+	}
 	frame := outboundFrame{
 		ConversationID: msg.ConversationID,
 		Content:        msg.Content,
+		Metadata:       meta,
 		Typing:         typing,
 	}
 	data, err := json.Marshal(frame)
