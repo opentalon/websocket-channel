@@ -190,6 +190,24 @@ func wsURL(srv *httptest.Server, token string) string {
 	return u
 }
 
+// readWelcome reads and discards the welcome frame the server sends on connect.
+// Returns the conversation_id from the welcome frame.
+func readWelcome(t *testing.T, ctx context.Context, conn *websocket.Conn) string {
+	t.Helper()
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("readWelcome: %v", err)
+	}
+	var frame outboundFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		t.Fatalf("readWelcome unmarshal: %v", err)
+	}
+	if frame.Metadata["type"] != "connected" {
+		t.Fatalf("readWelcome: expected type=connected, got %v", frame.Metadata)
+	}
+	return frame.ConversationID
+}
+
 func TestConnect_withQueryToken(t *testing.T) {
 	ch, inbox, srv, cleanup := testServer(t)
 	_ = ch
@@ -203,6 +221,7 @@ func TestConnect_withQueryToken(t *testing.T) {
 		t.Fatalf("Dial() = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	// Send a message and verify it arrives in inbox with correct token.
 	frame := inboundFrame{Content: "hello"}
@@ -245,6 +264,7 @@ func TestConnect_withBearerHeader(t *testing.T) {
 		t.Fatalf("Dial() with Bearer header = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	frame := inboundFrame{Content: "hi"}
 	data, _ := json.Marshal(frame)
@@ -288,6 +308,7 @@ func TestSend_deliversToClient(t *testing.T) {
 		t.Fatalf("Dial() = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	// Get the conversation ID assigned to this connection.
 	frame := inboundFrame{Content: "ping"}
@@ -339,6 +360,7 @@ func TestSend_typingIndicator(t *testing.T) {
 		t.Fatalf("Dial() = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	// Get conversation ID.
 	data, _ := json.Marshal(inboundFrame{Content: "hi"})
@@ -387,6 +409,7 @@ func TestInbound_withFileAttachment(t *testing.T) {
 		t.Fatalf("Dial() = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	fileBytes := []byte("col1,col2\n1,2\n3,4")
 	frame := inboundFrame{
@@ -437,6 +460,7 @@ func TestInbound_emptyFrame_skipped(t *testing.T) {
 		t.Fatalf("Dial() = %v", err)
 	}
 	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
 
 	empty := inboundFrame{}
 	data, _ := json.Marshal(empty)
@@ -463,6 +487,7 @@ func TestConversationID_uniquePerConnection(t *testing.T) {
 			t.Fatalf("Dial() = %v", err)
 		}
 		defer func() { _ = conn.CloseNow() }()
+		readWelcome(t, ctx, conn)
 		data, _ := json.Marshal(inboundFrame{Content: "hi"})
 		_ = conn.Write(ctx, websocket.MessageText, data)
 		select {

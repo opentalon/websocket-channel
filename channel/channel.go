@@ -27,8 +27,9 @@ type Config struct {
 }
 
 type wsConn struct {
-	ws *websocket.Conn
-	mu sync.Mutex
+	ws    *websocket.Conn
+	mu    sync.Mutex
+	token string // profile token that created this conversation (for reconnect auth)
 }
 
 // Channel is a WebSocket server channel. Browser clients connect to it with a
@@ -216,6 +217,8 @@ func (c *Channel) Stop() error {
 }
 
 // handleUpgrade upgrades an HTTP request to a WebSocket connection.
+// The client can pass ?conversation_id=<id> to resume a previous session
+// (reconnect). Without it, a new conversation ID is generated.
 func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
@@ -241,8 +244,28 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	convID := newID()
+	// Allow reconnection: if the client provides a conversation_id, reuse it
+	// so the session and its history are preserved across disconnects.
+	convID := r.URL.Query().Get("conversation_id")
+	if convID == "" {
+		convID = newID()
+	}
 	cn := &wsConn{ws: ws}
+
+	// If an old connection exists for this convID, verify the token matches
+	// (prevent session hijacking) and close the stale connection.
+	if old, loaded := c.conns.Load(convID); loaded {
+		if oldConn, ok := old.(*wsConn); ok {
+			if oldConn.token != "" && oldConn.token != token {
+				slog.Warn("websocket channel: reconnect rejected — token mismatch", "conversation_id", convID)
+				_ = ws.Close(websocket.StatusPolicyViolation, "token mismatch")
+				return
+			}
+			c.conns.Delete(convID)
+			_ = oldConn.ws.CloseNow()
+		}
+	}
+	cn.token = token
 	c.conns.Store(convID, cn)
 
 	c.stopMu.Lock()
@@ -259,6 +282,19 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		c.conns.Delete(convID)
 		_ = ws.CloseNow()
 	}()
+
+	// Send a welcome frame so the client knows its conversation_id for reconnection.
+	welcome := outboundFrame{
+		ConversationID: convID,
+		Metadata:       map[string]string{"type": "connected"},
+	}
+	if data, err := json.Marshal(welcome); err == nil {
+		cn.mu.Lock()
+		_ = ws.Write(r.Context(), websocket.MessageText, data)
+		cn.mu.Unlock()
+	}
+
+	slog.Info("websocket channel: client connected", "conversation_id", convID, "reconnect", r.URL.Query().Get("conversation_id") != "")
 
 	c.readLoop(r.Context(), ws, convID, token)
 }
