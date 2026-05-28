@@ -474,6 +474,76 @@ func TestInbound_emptyFrame_skipped(t *testing.T) {
 	}
 }
 
+func TestInbound_resumeIntent_setWhenClientSuppliedConvID(t *testing.T) {
+	// Client-supplied conversation_id at handshake must propagate as
+	// metadata["resume_intent"]="true" on every message from that
+	// connection. The core handler routes Load (strict) vs Create
+	// (idempotent) based on this flag — getting it wrong is the root
+	// of the silent-session-drift bug on standby/wake.
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=tok&conversation_id=existing-conv"
+	conn, _, err := websocket.Dial(ctx, u, nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	convID := readWelcome(t, ctx, conn)
+	if convID != "existing-conv" {
+		t.Fatalf("welcome convID = %q, want \"existing-conv\" (server must echo client id)", convID)
+	}
+
+	data, _ := json.Marshal(inboundFrame{Content: "still here?"})
+	_ = conn.Write(ctx, websocket.MessageText, data)
+
+	select {
+	case msg := <-inbox:
+		if got := msg.Metadata[pkg.ResumeIntentMetadataKey]; got != "true" {
+			t.Errorf("Metadata[resume_intent] = %q, want \"true\"", got)
+		}
+		if msg.ConversationID != "existing-conv" {
+			t.Errorf("ConversationID = %q, want \"existing-conv\"", msg.ConversationID)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for inbound message")
+	}
+}
+
+func TestInbound_resumeIntent_absentOnFreshHandshake(t *testing.T) {
+	// No client-supplied conversation_id => server mints => Create path
+	// in the core handler. resume_intent must be absent (not "false"),
+	// matching the absence semantics the handler expects.
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL(srv, "tok"), nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
+
+	data, _ := json.Marshal(inboundFrame{Content: "fresh start"})
+	_ = conn.Write(ctx, websocket.MessageText, data)
+
+	select {
+	case msg := <-inbox:
+		if _, present := msg.Metadata[pkg.ResumeIntentMetadataKey]; present {
+			t.Errorf("Metadata[resume_intent] should be absent on fresh handshake, got %q",
+				msg.Metadata[pkg.ResumeIntentMetadataKey])
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for inbound message")
+	}
+}
+
 func TestConversationID_uniquePerConnection(t *testing.T) {
 	_, inbox, srv, cleanup := testServer(t)
 	defer cleanup()

@@ -246,10 +246,14 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	// Allow reconnection: if the client provides a conversation_id, reuse it
 	// so the session and its history are preserved across disconnects.
-	convID := r.URL.Query().Get("conversation_id")
+	// A client-supplied id signals resume-intent to the core handler (see
+	// readLoop); a server-minted one signals fresh-create.
+	clientConvID := r.URL.Query().Get("conversation_id")
+	convID := clientConvID
 	if convID == "" {
 		convID = newID()
 	}
+	resumeIntent := clientConvID != ""
 	cn := &wsConn{ws: ws}
 
 	// If an old connection exists for this convID, verify the token matches
@@ -283,23 +287,34 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		_ = ws.CloseNow()
 	}()
 
-	// Send a welcome frame so the client knows its conversation_id for reconnection.
+	// Send a welcome frame so the client knows its conversation_id for
+	// reconnection. If the write fails the client never learns its id and
+	// any subsequent reconnect attempt with that id would be untrackable —
+	// bail out via the defer rather than enter readLoop on a half-open
+	// socket.
 	welcome := outboundFrame{
 		ConversationID: convID,
 		Metadata:       map[string]string{"type": "connected"},
 	}
-	if data, err := json.Marshal(welcome); err == nil {
-		cn.mu.Lock()
-		_ = ws.Write(r.Context(), websocket.MessageText, data)
-		cn.mu.Unlock()
+	data, err := json.Marshal(welcome)
+	if err != nil {
+		slog.Warn("websocket channel: welcome marshal failed", "conversation_id", convID, "error", err)
+		return
+	}
+	cn.mu.Lock()
+	werr := ws.Write(r.Context(), websocket.MessageText, data)
+	cn.mu.Unlock()
+	if werr != nil {
+		slog.Warn("websocket channel: welcome write failed", "conversation_id", convID, "error", werr)
+		return
 	}
 
-	slog.Info("websocket channel: client connected", "conversation_id", convID, "reconnect", r.URL.Query().Get("conversation_id") != "")
+	slog.Info("websocket channel: client connected", "conversation_id", convID, "reconnect", resumeIntent)
 
-	c.readLoop(r.Context(), ws, convID, token)
+	c.readLoop(r.Context(), ws, convID, token, resumeIntent)
 }
 
-func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, token string) {
+func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, token string, resumeIntent bool) {
 	for {
 		_, data, err := ws.Read(ctx)
 		if err != nil {
@@ -315,12 +330,20 @@ func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, toke
 			continue
 		}
 
+		meta := map[string]string{"profile_token": token}
+		if resumeIntent {
+			// Signal to the core handler: this conversation_id came from the
+			// client, not from server-side mint. Triggers strict Load and
+			// session_expired error frame on miss, instead of silent auto-
+			// create against a UI that still shows the prior history.
+			meta[pkg.ResumeIntentMetadataKey] = "true"
+		}
 		msg := pkg.InboundMessage{
 			ChannelID:      ID,
 			ConversationID: convID,
 			SenderID:       convID,
 			Content:        frame.Content,
-			Metadata:       map[string]string{"profile_token": token},
+			Metadata:       meta,
 			Timestamp:      time.Now(),
 		}
 
