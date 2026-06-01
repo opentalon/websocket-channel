@@ -838,6 +838,72 @@ func TestNewWhoamiResolver_requiresURL(t *testing.T) {
 	}
 }
 
+func TestWhoamiResolver_resolve(t *testing.T) {
+	ctx := context.Background()
+
+	// Success: returns entity_id AND sends the exact /whoami contract headers.
+	t.Run("success_sends_contract_headers", func(t *testing.T) {
+		var gotUser, gotChan, gotSecret string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotUser = r.Header.Get("X-User-ID")
+			gotChan = r.Header.Get("X-Channel-Type")
+			gotSecret = r.Header.Get("X-Security-Token")
+			_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "user-42", "group": "g1"})
+		}))
+		defer srv.Close()
+		r, err := newWhoamiResolver(srv.URL, "sek")
+		if err != nil {
+			t.Fatalf("newWhoamiResolver: %v", err)
+		}
+		id, err := r.resolve(ctx, "tok-abc")
+		if err != nil || id != "user-42" {
+			t.Fatalf("resolve = %q, %v; want \"user-42\", nil", id, err)
+		}
+		if gotUser != "tok-abc" || gotChan != ID || gotSecret != "sek" {
+			t.Errorf("headers wrong: X-User-ID=%q X-Channel-Type=%q X-Security-Token=%q", gotUser, gotChan, gotSecret)
+		}
+	})
+
+	// Fail-closed: every non-happy outcome must yield an error (caller refuses the socket).
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"status_500", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
+		{"malformed_json", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{not json")) }},
+		{"missing_entity_id", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]string{"group": "g1"})
+		}},
+	} {
+		t.Run("failclosed_"+tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			r, _ := newWhoamiResolver(srv.URL, "sek")
+			if id, err := r.resolve(ctx, "tok"); err == nil {
+				t.Errorf("%s: expected error, got id=%q nil", tc.name, id)
+			}
+		})
+	}
+
+	// Secret falls back to the inherited WHOAMI_SECRET env when not given in config.
+	t.Run("secret_env_fallback", func(t *testing.T) {
+		t.Setenv("WHOAMI_SECRET", "from-env")
+		var gotSecret string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotSecret = r.Header.Get("X-Security-Token")
+			_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "u"})
+		}))
+		defer srv.Close()
+		r, _ := newWhoamiResolver(srv.URL, "") // empty config secret → env fallback
+		if _, err := r.resolve(ctx, "tok"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if gotSecret != "from-env" {
+			t.Errorf("X-Security-Token = %q, want \"from-env\" (env fallback)", gotSecret)
+		}
+	})
+}
+
 func TestConnRegistry_lastSocketDeletesBucket(t *testing.T) {
 	// White-box: a conversation key must not linger after its last socket leaves,
 	// or the map grows unbounded across reconnects.

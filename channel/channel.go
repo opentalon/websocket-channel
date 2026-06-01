@@ -404,7 +404,7 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 		// sibling tabs. The sending socket already rendered any real message
 		// locally and is skipped inside broadcastUserInput.
 		if frame.Content != "" && !isControlReply(frame.Metadata) {
-			c.broadcastUserInput(ctx, convID, cn, frame.Content)
+			c.broadcastUserInput(convID, cn, frame.Content)
 		}
 
 		meta := map[string]string{"profile_token": token}
@@ -520,7 +520,7 @@ func isControlReply(meta map[string]any) bool {
 // server transcript. The sending socket is skipped: it already rendered the
 // message locally. Carries metadata type "user_message" so the client renders
 // it as a user bubble rather than an assistant reply.
-func (c *Channel) broadcastUserInput(ctx context.Context, convID string, sender *wsConn, content string) {
+func (c *Channel) broadcastUserInput(convID string, sender *wsConn, content string) {
 	targets := c.targets(convID)
 	if len(targets) <= 1 {
 		return // sender is the only connection; nothing to echo
@@ -538,7 +538,11 @@ func (c *Channel) broadcastUserInput(ctx context.Context, convID string, sender 
 		if cn == sender {
 			continue
 		}
-		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		// Decouple sibling-echo writes from the SENDER's connection lifetime:
+		// the sender disconnecting must not cut short — or, via the library's
+		// born-cancelled-context teardown, prematurely close — delivery to the
+		// user's OTHER tabs. Independent timeout, like the assistant fan-out in Send.
+		wctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 		cn.mu.Lock()
 		werr := cn.ws.Write(wctx, websocket.MessageText, data)
 		cn.mu.Unlock()
