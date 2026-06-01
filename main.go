@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"strings"
 
-	wschannel "github.com/opentalon/websocket-channel/channel"
 	"github.com/opentalon/opentalon/pkg/channel"
+	wschannel "github.com/opentalon/websocket-channel/channel"
 )
 
 func main() {
@@ -19,11 +19,15 @@ func run() int {
 	addr := flag.String("addr", "0.0.0.0:9000", "WebSocket server address (host:port)")
 	path := flag.String("path", "/ws", "WebSocket endpoint path")
 	origins := flag.String("origins", "", "Comma-separated allowed CORS origins (empty = allow all)")
+	whoamiURL := flag.String("whoami-url", "", "Timly /whoami endpoint for identity resolution (required)")
+	whoamiSecret := flag.String("whoami-secret", "", "Shared secret for /whoami (X-Security-Token); falls back to WHOAMI_SECRET env")
 	flag.Parse()
 
 	cfg := wschannel.Config{
-		Addr: *addr,
-		Path: *path,
+		Addr:         *addr,
+		Path:         *path,
+		WhoamiURL:    *whoamiURL,
+		WhoamiSecret: *whoamiSecret,
 	}
 	if *origins != "" {
 		for _, o := range strings.Split(*origins, ",") {
