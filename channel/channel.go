@@ -139,6 +139,10 @@ func (c *Channel) Configure(config map[string]interface{}) error {
 // ID implements pkg.Channel.
 func (c *Channel) ID() string { return ID }
 
+// Kind implements pkg.Channel. The websocket channel runs as a single
+// instance, so its channel type and its per-instance ID are the same value.
+func (c *Channel) Kind() string { return ID }
+
 // Capabilities implements pkg.Channel.
 func (c *Channel) Capabilities() pkg.Capabilities {
 	return pkg.Capabilities{
