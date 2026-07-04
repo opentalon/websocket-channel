@@ -872,6 +872,28 @@ func TestUpgrade_resumeConnect_EmitsResumeHello(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("resume hello never reached inbox")
 	}
+
+	// Fresh connect (no conversation_id → server-minted id) must NOT emit a
+	// resume_hello: only the user's own message reaches core, with no control
+	// key. The resume hello above was already drained, so the next inbox item
+	// is the fresh message itself.
+	fresh, _ := dialConvID(t, ctx, srv, "tabA", "")
+	defer func() { _ = fresh.CloseNow() }()
+	data, _ := json.Marshal(inboundFrame{Content: "hi fresh"})
+	if err := fresh.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Fatalf("fresh write: %v", err)
+	}
+	select {
+	case msg := <-inbox:
+		if msg.Metadata[controlMetadataKey] != "" {
+			t.Errorf("fresh connect emitted a control frame: %+v", msg.Metadata)
+		}
+		if msg.Content != "hi fresh" {
+			t.Errorf("fresh inbox content = %q, want \"hi fresh\"", msg.Content)
+		}
+	case <-ctx.Done():
+		t.Fatal("fresh user message never reached inbox")
+	}
 }
 
 func TestUpgrade_whoamiRejects_unauthorized(t *testing.T) {

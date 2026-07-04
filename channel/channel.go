@@ -563,9 +563,12 @@ func (c *Channel) targets(convID string) []*wsConn {
 	return out
 }
 
-// isControlReply reports whether an inbound frame is a UI control action (e.g.
-// a tool-confirmation y/n click), not a chat message the user typed. Such
-// replies must not be echoed to the user's other tabs as a message.
+// isControlReply reports whether an inbound frame is a tool-confirmation
+// decision (prompt_type=confirmation_response). Used to forward the structured
+// approve/reject decision to core as metadata["confirmation"]. The reply text
+// itself (a localized "Approve"/"Reject" label) is still echoed to the user's
+// other tabs like any user message — seeing it is how a sibling tab learns its
+// own open confirmation was answered here.
 func isControlReply(meta map[string]any) bool {
 	pt, _ := meta["prompt_type"].(string)
 	return pt == "confirmation_response"
