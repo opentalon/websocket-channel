@@ -22,6 +22,17 @@ import (
 // ID is the channel identifier for the WebSocket channel.
 const ID = "websocket"
 
+// controlMetadataKey / controlResumeHello mirror the core's
+// pkg/channel.ControlMetadataKey / ControlResumeHello string contract. They are
+// kept as literals (not the pkg constants) so this plugin keeps building
+// against its currently-pinned core module version — the wire contract is the
+// string value, which the core reads via its own constant. Switch to the pkg
+// constants once the core dependency is bumped to a release carrying them.
+const (
+	controlMetadataKey = "control"
+	controlResumeHello = "resume_hello"
+)
+
 // writeTimeout bounds a single fan-out write so one stuck socket (e.g. a
 // half-open TCP connection after a laptop sleep) cannot delay delivery to a
 // user's other connections beyond this bound.
@@ -382,6 +393,32 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("websocket channel: client connected", "conversation_id", convID, "reconnect", resumeIntent)
 
+	// Resume handshake: on a reconnect (client-supplied conversation_id) send
+	// one control message to core BEFORE the user types. If a tool confirmation
+	// is still awaiting the user's decision, core re-emits its prompt frame so
+	// this freshly-reconnected tab redraws the Approve/Reject buttons instead of
+	// showing a dead transcript. The socket is already in the fan-out set (added
+	// above), so the re-emit reaches it. A fresh connection (server-minted id)
+	// has no prior pending state, so the hello is resume-only.
+	if resumeIntent {
+		hello := pkg.InboundMessage{
+			ChannelID:      ID,
+			ConversationID: convID,
+			SenderID:       convID,
+			Metadata: map[string]string{
+				"profile_token":             token,
+				pkg.ResumeIntentMetadataKey: "true",
+				controlMetadataKey:          controlResumeHello,
+			},
+			Timestamp: time.Now(),
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case c.inbox <- hello:
+		}
+	}
+
 	c.readLoop(r.Context(), cn, convID, token, resumeIntent)
 }
 
@@ -402,12 +439,15 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 		}
 
 		// Echo the user's text to their OTHER tabs so it shows up there live,
-		// not just the assistant's reply. Skip control replies like a tool-
-		// confirmation y/n click (prompt_type=confirmation_response): those are
-		// not chat messages and would render as a stray "y"/"n" bubble in the
-		// sibling tabs. The sending socket already rendered any real message
-		// locally and is skipped inside broadcastUserInput.
-		if frame.Content != "" && !isControlReply(frame.Metadata) {
+		// not just the assistant's reply. Confirmation replies are echoed too:
+		// the widget now sends a readable localized label ("Approve"/"Reject")
+		// as the content, not a bare "y"/"n", so it reads as a normal user
+		// bubble — and seeing the reply is what tells a sibling tab its own
+		// still-open confirmation was answered elsewhere, so it retires those
+		// buttons instead of leaving a stale, clickable prompt. The sending
+		// socket already rendered the message locally and is skipped inside
+		// broadcastUserInput.
+		if frame.Content != "" {
 			c.broadcastUserInput(convID, cn, frame.Content)
 		}
 
@@ -523,9 +563,12 @@ func (c *Channel) targets(convID string) []*wsConn {
 	return out
 }
 
-// isControlReply reports whether an inbound frame is a UI control action (e.g.
-// a tool-confirmation y/n click), not a chat message the user typed. Such
-// replies must not be echoed to the user's other tabs as a message.
+// isControlReply reports whether an inbound frame is a tool-confirmation
+// decision (prompt_type=confirmation_response). Used to forward the structured
+// approve/reject decision to core as metadata["confirmation"]. The reply text
+// itself (a localized "Approve"/"Reject" label) is still echoed to the user's
+// other tabs like any user message — seeing it is how a sibling tab learns its
+// own open confirmation was answered here.
 func isControlReply(meta map[string]any) bool {
 	pt, _ := meta["prompt_type"].(string)
 	return pt == "confirmation_response"
