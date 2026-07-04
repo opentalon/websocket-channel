@@ -263,6 +263,25 @@ func readWelcome(t *testing.T, ctx context.Context, conn *websocket.Conn) string
 	return frame.ConversationID
 }
 
+// recvInbox reads the next NON-control message from the core inbox, skipping the
+// resume-handshake control frame that a resumed dial (conversation_id supplied)
+// now emits on connect. Use it wherever a test asserts on the user's message.
+func recvInbox(t *testing.T, ctx context.Context, inbox <-chan pkg.InboundMessage) pkg.InboundMessage {
+	t.Helper()
+	for {
+		select {
+		case msg := <-inbox:
+			if msg.Metadata[controlMetadataKey] != "" {
+				continue
+			}
+			return msg
+		case <-ctx.Done():
+			t.Fatal("no non-control message reached inbox")
+			return pkg.InboundMessage{}
+		}
+	}
+}
+
 func TestConnect_withQueryToken(t *testing.T) {
 	ch, inbox, srv, cleanup := testServer(t)
 	_ = ch
@@ -743,14 +762,10 @@ func TestReadLoop_userInputEchoedToSiblingsNotSender(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// The inbound still reaches the core inbox (drain it so readLoop isn't blocked).
-	select {
-	case msg := <-inbox:
-		if msg.Content != "hello siblings" {
-			t.Errorf("inbox content = %q, want \"hello siblings\"", msg.Content)
-		}
-	case <-ctx.Done():
-		t.Fatal("inbound never reached inbox")
+	// The inbound still reaches the core inbox (skip the resume-handshake
+	// control frames the two resumed dials emit on connect).
+	if msg := recvInbox(t, ctx, inbox); msg.Content != "hello siblings" {
+		t.Errorf("inbox content = %q, want \"hello siblings\"", msg.Content)
 	}
 
 	// Sibling tab B receives the echo as a user_message.
@@ -770,10 +785,13 @@ func TestReadLoop_userInputEchoedToSiblingsNotSender(t *testing.T) {
 	}
 }
 
-func TestReadLoop_confirmationReplyNotEchoed(t *testing.T) {
-	// A tool-confirmation y/n click (prompt_type=confirmation_response) still
-	// reaches the core, but must NOT be echoed to sibling tabs — otherwise a
-	// stray "y" bubble shows up in the other tab.
+func TestReadLoop_confirmationReplyEchoedToSiblings(t *testing.T) {
+	// A tool-confirmation click now sends a readable localized label ("Approve")
+	// as content, so it IS echoed to sibling tabs like any user message — that
+	// echo is what tells the other tab its own still-open confirmation was
+	// answered here, so it retires those buttons instead of leaving them
+	// clickable. The reply still reaches core (with the confirmation decision)
+	// and is NOT echoed back to the sending tab.
 	_, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"tabA": "user1", "tabB": "user1"})
 	defer cleanup()
 
@@ -786,28 +804,73 @@ func TestReadLoop_confirmationReplyNotEchoed(t *testing.T) {
 	defer func() { _ = connB.CloseNow() }()
 
 	data, _ := json.Marshal(inboundFrame{
-		Content:  "y",
+		Content:  "Approve",
 		Metadata: map[string]any{"prompt_type": "confirmation_response", "action": "approve"},
 	})
 	if err := connA.Write(ctx, websocket.MessageText, data); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	// Still forwarded to the core so the confirmation actually resolves.
-	select {
-	case msg := <-inbox:
-		if msg.Content != "y" {
-			t.Errorf("inbox content = %q, want \"y\"", msg.Content)
-		}
-	case <-ctx.Done():
-		t.Fatal("confirmation reply never reached inbox")
+	// Reaches core with the deterministic confirmation decision so the write
+	// actually resolves (skip the resume-handshake control frames on connect).
+	msg := recvInbox(t, ctx, inbox)
+	if msg.Content != "Approve" {
+		t.Errorf("inbox content = %q, want \"Approve\"", msg.Content)
+	}
+	if msg.Metadata["confirmation"] != "approve" {
+		t.Errorf("inbox confirmation = %q, want \"approve\"", msg.Metadata["confirmation"])
 	}
 
-	// Sibling tab B must NOT receive an echo of the control reply.
+	// Sibling tab B DOES receive the echo as a user_message bubble.
+	echo := readContent(t, ctx, connB)
+	if echo.Metadata["type"] != "user_message" {
+		t.Errorf("sibling frame type = %q, want \"user_message\"", echo.Metadata["type"])
+	}
+	if echo.Content != "Approve" {
+		t.Errorf("sibling echo content = %q, want \"Approve\"", echo.Content)
+	}
+
+	// Sender tab A must NOT receive an echo of its own reply.
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer shortCancel()
-	if _, _, err := connB.Read(shortCtx); err == nil {
-		t.Error("confirmation reply should not be echoed to sibling tabs")
+	if _, _, err := connA.Read(shortCtx); err == nil {
+		t.Error("sender should not receive an echo of its own confirmation reply")
+	}
+}
+
+func TestUpgrade_resumeConnect_EmitsResumeHello(t *testing.T) {
+	// A reconnect (client-supplied conversation_id) emits exactly one
+	// resume-handshake control message to core so a pending confirmation can be
+	// re-emitted — carrying resume_intent + the profile token, with empty
+	// content. A fresh connect (server-minted id) emits none.
+	_, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"tabA": "user1"})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "shared")
+	defer func() { _ = conn.CloseNow() }()
+
+	select {
+	case msg := <-inbox:
+		if msg.Metadata[controlMetadataKey] != controlResumeHello {
+			t.Errorf("control = %q, want %q", msg.Metadata[controlMetadataKey], controlResumeHello)
+		}
+		if msg.Metadata[pkg.ResumeIntentMetadataKey] != "true" {
+			t.Errorf("resume_intent = %q, want true", msg.Metadata[pkg.ResumeIntentMetadataKey])
+		}
+		if msg.Metadata["profile_token"] != "tabA" {
+			t.Errorf("profile_token = %q, want tabA", msg.Metadata["profile_token"])
+		}
+		if msg.Content != "" {
+			t.Errorf("resume hello content = %q, want empty", msg.Content)
+		}
+		if msg.ConversationID != "shared" {
+			t.Errorf("conversation_id = %q, want shared", msg.ConversationID)
+		}
+	case <-ctx.Done():
+		t.Fatal("resume hello never reached inbox")
 	}
 }
 
