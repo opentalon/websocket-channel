@@ -188,6 +188,12 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(c.cfg.Path, c.handleUpgrade)
+	// Server-side inject: a trusted backend (not a browser) posts a message
+	// into an existing conversation — e.g. a hidden system status note from a
+	// finished background job. Same delivery path as a live socket, minus the
+	// socket: the message is handed to the core, whose reply fans out to the
+	// user's live browser sockets for that conversation.
+	mux.HandleFunc(c.cfg.Path+"/inject", c.handleInject)
 
 	c.srv = &http.Server{
 		Addr:    c.cfg.Addr,
@@ -297,6 +303,69 @@ func (c *Channel) Stop() error {
 // handleUpgrade upgrades an HTTP request to a WebSocket connection.
 // The client can pass ?conversation_id=<id> to resume a previous session
 // (reconnect). Without it, a new conversation ID is generated.
+// handleInject accepts a server-to-server message injection. A trusted backend
+// POSTs {token, conversation_id, content, visibility, resume_intent}; the token
+// is resolved to its owning user (same whoami as the socket upgrade), and the
+// message is pushed to the core as an InboundMessage. There is no socket and no
+// reply on this request — the core's reply is delivered to the user's live
+// browser sockets for the conversation. Because the core re-scopes the
+// conversation id to the token owner, a message can only ever reach that user's
+// own conversation.
+func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Token          string `json:"token"`
+		ConversationID string `json:"conversation_id"`
+		Content        string `json:"content"`
+		Visibility     string `json:"visibility"`
+		ResumeIntent   string `json:"resume_intent"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if body.Token == "" || body.ConversationID == "" || body.Content == "" {
+		http.Error(w, "token, conversation_id and content are required", http.StatusBadRequest)
+		return
+	}
+
+	// Fail closed: an unresolvable token never reaches the core.
+	if _, err := c.resolver.resolve(r.Context(), body.Token); err != nil {
+		slog.Warn("websocket channel: inject identity resolution failed", "error", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	meta := map[string]string{"profile_token": body.Token}
+	if body.ResumeIntent != "" {
+		meta[pkg.ResumeIntentMetadataKey] = body.ResumeIntent
+	}
+	if body.Visibility != "" {
+		meta["visibility"] = body.Visibility
+	}
+	msg := pkg.InboundMessage{
+		ChannelID:      ID,
+		ConversationID: body.ConversationID,
+		SenderID:       body.ConversationID,
+		Content:        body.Content,
+		Metadata:       meta,
+		Timestamp:      time.Now(),
+	}
+
+	select {
+	case c.inbox <- msg:
+		w.WriteHeader(http.StatusAccepted)
+	case <-r.Context().Done():
+		http.Error(w, "request cancelled", http.StatusRequestTimeout)
+	case <-time.After(writeTimeout):
+		http.Error(w, "channel busy", http.StatusServiceUnavailable)
+	}
+}
+
 func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {

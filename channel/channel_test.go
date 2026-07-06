@@ -214,11 +214,74 @@ func testServerWithUsers(t *testing.T, mapping map[string]string) (*Channel, <-c
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ch.handleUpgrade)
+	mux.HandleFunc("/ws/inject", ch.handleInject)
 	srv := httptest.NewServer(mux)
 
 	return ch, inbox, srv, func() {
 		srv.Close()
 		_ = ch.Stop()
+	}
+}
+
+func TestHandleInject_pushesHiddenMessageToInbox(t *testing.T) {
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	body := `{"token":"u1","conversation_id":"conv1","content":"[system] job done","visibility":"hidden","resume_intent":"true"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST inject: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	select {
+	case msg := <-inbox:
+		if msg.ConversationID != "conv1" {
+			t.Errorf("ConversationID = %q, want conv1", msg.ConversationID)
+		}
+		if msg.Content != "[system] job done" {
+			t.Errorf("Content = %q", msg.Content)
+		}
+		if msg.Metadata["visibility"] != "hidden" {
+			t.Errorf("visibility = %q, want hidden", msg.Metadata["visibility"])
+		}
+		if msg.Metadata[pkg.ResumeIntentMetadataKey] != "true" {
+			t.Errorf("resume_intent = %q, want true", msg.Metadata[pkg.ResumeIntentMetadataKey])
+		}
+		if msg.Metadata["profile_token"] != "u1" {
+			t.Errorf("profile_token = %q, want u1", msg.Metadata["profile_token"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no message pushed to inbox")
+	}
+}
+
+func TestHandleInject_rejectsBadTokenAndMissingFields(t *testing.T) {
+	// Token "" resolves to entity_id "" → whoami 404 → unauthorized.
+	_, _, srv, cleanup := testServerWithUsers(t, map[string]string{"bad": ""})
+	defer cleanup()
+
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json",
+		strings.NewReader(`{"token":"bad","conversation_id":"c","content":"x"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("bad token: status = %d, want 401", resp.StatusCode)
+	}
+
+	resp2, err := http.Post(srv.URL+"/ws/inject", "application/json",
+		strings.NewReader(`{"token":"u1","conversation_id":"c"}`)) // no content
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Errorf("missing content: status = %d, want 400", resp2.StatusCode)
 	}
 }
 
