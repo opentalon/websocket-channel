@@ -283,6 +283,26 @@ func TestHandleInject_rejectsBadTokenAndMissingFields(t *testing.T) {
 	if resp2.StatusCode != http.StatusBadRequest {
 		t.Errorf("missing content: status = %d, want 400", resp2.StatusCode)
 	}
+
+	// Any non-POST method is rejected before touching the body or the resolver.
+	respGet, err := http.Get(srv.URL + "/ws/inject")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_ = respGet.Body.Close()
+	if respGet.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET: status = %d, want 405", respGet.StatusCode)
+	}
+
+	// A malformed JSON body is rejected with 400.
+	respBad, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(`{not json`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = respBad.Body.Close()
+	if respBad.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed body: status = %d, want 400", respBad.StatusCode)
+	}
 }
 
 // dialConvID dials the channel with a token and (optional) conversation_id and
@@ -531,6 +551,37 @@ func TestSend_typingIndicator(t *testing.T) {
 	}
 	if out.Content != "" {
 		t.Errorf("typing frame should have empty content, got %q", out.Content)
+	}
+}
+
+// TestInbound_clientVisibilityIsIgnored is the security regression guard: a
+// browser frame that sets visibility=hidden must NOT be honored — hiding a turn
+// from the audited transcript is reserved for the trusted /inject path. The
+// forwarded message must carry no visibility metadata.
+func TestInbound_clientVisibilityIsIgnored(t *testing.T) {
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL(srv, "tok"), nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
+
+	// Raw frame carrying a visibility field a client must not be able to set.
+	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"content":"sneaky","visibility":"hidden"}`))
+
+	select {
+	case msg := <-inbox:
+		if v, ok := msg.Metadata["visibility"]; ok {
+			t.Errorf("client visibility was honored: metadata[visibility]=%q, want absent", v)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for inbound message")
 	}
 }
 

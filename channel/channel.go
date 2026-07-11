@@ -86,16 +86,14 @@ type Channel struct {
 	wg      sync.WaitGroup
 }
 
-// inboundFrame is the JSON structure for client → server messages.
+// inboundFrame is the JSON structure for client → server messages. A client
+// cannot set message visibility: hiding a turn from the audited transcript is a
+// privileged capability reserved for the server-to-server /inject path, so no
+// `visibility` field is accepted here.
 type inboundFrame struct {
 	Content  string         `json:"content"`
 	Files    []fileFrame    `json:"files,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"` // client hints (e.g. prompt_type); used locally — only the confirmation decision is forwarded to core (see metadata["confirmation"])
-	// Visibility "hidden" marks a system-injected turn (e.g. a backend job's
-	// status note): it is forwarded to core for the model, suppressed from the
-	// live sibling-tab echo, and hidden from the customer transcript by the
-	// api-plugin. Ordinary client messages leave this empty.
-	Visibility string `json:"visibility,omitempty"`
 }
 
 type fileFrame struct {
@@ -300,9 +298,6 @@ func (c *Channel) Stop() error {
 	return nil
 }
 
-// handleUpgrade upgrades an HTTP request to a WebSocket connection.
-// The client can pass ?conversation_id=<id> to resume a previous session
-// (reconnect). Without it, a new conversation ID is generated.
 // handleInject accepts a server-to-server message injection. A trusted backend
 // POSTs {token, conversation_id, content, visibility, resume_intent}; the token
 // is resolved to its owning user (same whoami as the socket upgrade), and the
@@ -366,6 +361,9 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleUpgrade upgrades an HTTP request to a WebSocket connection.
+// The client can pass ?conversation_id=<id> to resume a previous session
+// (reconnect). Without it, a new conversation ID is generated.
 func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
@@ -521,16 +519,16 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 		// buttons instead of leaving a stale, clickable prompt. The sending
 		// socket already rendered the message locally and is skipped inside
 		// broadcastUserInput.
-		// A hidden (system-injected) turn is never echoed to the user's other
-		// tabs — its whole point is that the user does not see the raw trigger.
-		if frame.Content != "" && frame.Visibility != "hidden" {
+		if frame.Content != "" {
 			c.broadcastUserInput(convID, cn, frame.Content)
 		}
 
+		// Visibility is NOT read from the client frame: hiding a turn from the
+		// audited transcript is a privileged capability reserved for the trusted
+		// server-to-server /inject path (handleInject sets it there). Honoring a
+		// browser-supplied visibility would let a user feed model-directed
+		// content while keeping it out of the transcript and their sibling tabs.
 		meta := map[string]string{"profile_token": token}
-		if frame.Visibility != "" {
-			meta["visibility"] = frame.Visibility
-		}
 		if resumeIntent {
 			// Signal to the core handler: this conversation_id came from the
 			// client, not from server-side mint. Triggers strict Load and

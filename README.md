@@ -77,6 +77,33 @@ Connections without a token are rejected with HTTP 401.
 
 `content` is HTML. Each WebSocket connection gets a unique `conversation_id`.
 
+Clients cannot set message visibility — hiding a turn from the audited
+transcript is reserved for the server-to-server inject endpoint below.
+
+**Server-to-server inject** (`POST {path}/inject`)
+
+A trusted backend posts a message into an existing conversation without holding
+a socket — e.g. an async job reporting completion back into the chat that
+started it. The token is resolved to its owning user (same whoami as the socket
+upgrade), so a message can only ever reach that user's own conversation.
+
+```json
+{
+  "token": "<profile_token>",
+  "conversation_id": "3f2a1b...",
+  "content": "[system] Your job finished.",
+  "visibility": "hidden",
+  "resume_intent": "true"
+}
+```
+
+Returns `202` on accept (`400` bad body / missing field, `401` unresolvable
+token, `405` non-POST). There is no reply on this request: the core's reply
+fans out to the user's live browser sockets for the conversation. `visibility:
+"hidden"` marks the injected turn as model-only — fed to the model but dropped
+from the user-facing transcript (honored only for a WhoAmI-verified system
+profile).
+
 ## Demo
 
 ```bash
