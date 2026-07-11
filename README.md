@@ -98,7 +98,10 @@ upgrade), so a message can only ever reach that user's own conversation.
 ```
 
 Returns `202` on accept (`400` bad body / missing field, `401` unresolvable
-token, `405` non-POST). There is no reply on this request: the core's reply
+token, `403` the conversation is owned by a different user, `405` non-POST).
+The token is resolved to its owner and, if the conversation already has live
+sockets, they must belong to that same owner — an inject can never deliver into
+another user's conversation. There is no reply on this request: the core's reply
 fans out to the user's live browser sockets for the conversation. `visibility:
 "hidden"` marks the injected turn as model-only — fed to the model but dropped
 from the user-facing transcript (honored only for a WhoAmI-verified system

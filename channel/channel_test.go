@@ -259,6 +259,53 @@ func TestHandleInject_pushesHiddenMessageToInbox(t *testing.T) {
 	}
 }
 
+// TestHandleInject_ownershipGate is the security boundary: a token resolving to
+// user u2 must NOT inject into a conversation whose live sockets are owned by
+// u1 (else the core's reply, addressed by the raw conversation id, would fan out
+// to u1's sockets). The conversation's own owner is still accepted.
+func TestHandleInject_ownershipGate(t *testing.T) {
+	ch, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	// u1 owns "conv1": register a live socket under it (default whoami maps a
+	// token to its own entity, so "u1" is entity u1).
+	if err := ch.addConn("conv1", "u1", &wsConn{}); err != nil {
+		t.Fatalf("addConn: %v", err)
+	}
+
+	// A foreign user (u2) is refused with 403 and never reaches the core.
+	foreign := `{"token":"u2","conversation_id":"conv1","content":"[system] x"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(foreign))
+	if err != nil {
+		t.Fatalf("POST foreign: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign inject: status = %d, want 403", resp.StatusCode)
+	}
+	select {
+	case msg := <-inbox:
+		t.Fatalf("foreign inject must not reach the core, got %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The conversation's own owner (u1) is still accepted even with a live socket.
+	own := `{"token":"u1","conversation_id":"conv1","content":"[system] job done"}`
+	resp2, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(own))
+	if err != nil {
+		t.Fatalf("POST own: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("owner inject: status = %d, want 202", resp2.StatusCode)
+	}
+	select {
+	case <-inbox: // good, enqueued
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner inject did not reach the core")
+	}
+}
+
 func TestHandleInject_rejectsBadTokenAndMissingFields(t *testing.T) {
 	// Token "" resolves to entity_id "" → whoami 404 → unauthorized.
 	_, _, srv, cleanup := testServerWithUsers(t, map[string]string{"bad": ""})

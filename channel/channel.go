@@ -303,9 +303,12 @@ func (c *Channel) Stop() error {
 // is resolved to its owning user (same whoami as the socket upgrade), and the
 // message is pushed to the core as an InboundMessage. There is no socket and no
 // reply on this request — the core's reply is delivered to the user's live
-// browser sockets for the conversation. Because the core re-scopes the
-// conversation id to the token owner, a message can only ever reach that user's
-// own conversation.
+// browser sockets for the conversation. The core addresses that reply by the
+// raw conversation id, so this handler enforces the same single-owner invariant
+// as the socket upgrade: if the conversation already has live sockets owned by
+// a different user, the inject is refused (403). A conversation with no live
+// socket has nothing to fan out to, so a background job may still inject into a
+// currently-disconnected conversation of its own owner.
 func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -329,9 +332,22 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fail closed: an unresolvable token never reaches the core.
-	if _, err := c.resolver.resolve(r.Context(), body.Token); err != nil {
+	entityID, err := c.resolver.resolve(r.Context(), body.Token)
+	if err != nil {
 		slog.Warn("websocket channel: inject identity resolution failed", "error", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Ownership gate, mirroring the socket upgrade's errOwnerMismatch: a
+	// conversation is owned by exactly one user. If it already has live sockets
+	// owned by a DIFFERENT user, refuse — otherwise the core's reply (addressed
+	// by the raw conversation id) would fan out to that other user's sockets.
+	// No live socket → no set → nothing to leak to, so a job may still inject
+	// into a currently-disconnected conversation of its own owner.
+	if owner, ok := c.conversationOwner(body.ConversationID); ok && owner != entityID {
+		slog.Warn("websocket channel: inject refused — conversation owned by another user", "conversation_id", body.ConversationID)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -622,6 +638,21 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 	if len(set.conns) == 0 {
 		delete(c.conns, convID)
 	}
+}
+
+// conversationOwner returns the entity that owns convID and whether any live
+// socket set currently exists for it. Used by the inject handler to refuse a
+// cross-user delivery: the fan-out in Send is keyed by the raw conversation id
+// and relies on every set being single-owner (pinned at upgrade), so inject
+// must honour that same invariant rather than trusting the caller's id.
+func (c *Channel) conversationOwner(convID string) (string, bool) {
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
+	set, ok := c.conns[convID]
+	if !ok {
+		return "", false
+	}
+	return set.ownerEntityID, true
 }
 
 // targets returns a snapshot of the live sockets for convID. The caller writes
