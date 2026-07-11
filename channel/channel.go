@@ -86,7 +86,10 @@ type Channel struct {
 	wg      sync.WaitGroup
 }
 
-// inboundFrame is the JSON structure for client → server messages.
+// inboundFrame is the JSON structure for client → server messages. A client
+// cannot set message visibility: hiding a turn from the audited transcript is a
+// privileged capability reserved for the server-to-server /inject path, so no
+// `visibility` field is accepted here.
 type inboundFrame struct {
 	Content  string         `json:"content"`
 	Files    []fileFrame    `json:"files,omitempty"`
@@ -183,6 +186,12 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(c.cfg.Path, c.handleUpgrade)
+	// Server-side inject: a trusted backend (not a browser) posts a message
+	// into an existing conversation — e.g. a hidden system status note from a
+	// finished background job. Same delivery path as a live socket, minus the
+	// socket: the message is handed to the core, whose reply fans out to the
+	// user's live browser sockets for that conversation.
+	mux.HandleFunc(c.cfg.Path+"/inject", c.handleInject)
 
 	c.srv = &http.Server{
 		Addr:    c.cfg.Addr,
@@ -287,6 +296,85 @@ func (c *Channel) Stop() error {
 	c.stopMu.Unlock()
 	c.wg.Wait()
 	return nil
+}
+
+// handleInject accepts a server-to-server message injection. A trusted backend
+// POSTs {token, conversation_id, content, visibility, resume_intent}; the token
+// is resolved to its owning user (same whoami as the socket upgrade), and the
+// message is pushed to the core as an InboundMessage. There is no socket and no
+// reply on this request — the core's reply is delivered to the user's live
+// browser sockets for the conversation. The core addresses that reply by the
+// raw conversation id, so this handler enforces the same single-owner invariant
+// as the socket upgrade: if the conversation already has live sockets owned by
+// a different user, the inject is refused (403). A conversation with no live
+// socket has nothing to fan out to, so a background job may still inject into a
+// currently-disconnected conversation of its own owner.
+func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Token          string `json:"token"`
+		ConversationID string `json:"conversation_id"`
+		Content        string `json:"content"`
+		Visibility     string `json:"visibility"`
+		ResumeIntent   string `json:"resume_intent"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if body.Token == "" || body.ConversationID == "" || body.Content == "" {
+		http.Error(w, "token, conversation_id and content are required", http.StatusBadRequest)
+		return
+	}
+
+	// Fail closed: an unresolvable token never reaches the core.
+	entityID, err := c.resolver.resolve(r.Context(), body.Token)
+	if err != nil {
+		slog.Warn("websocket channel: inject identity resolution failed", "error", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Ownership gate, mirroring the socket upgrade's errOwnerMismatch: a
+	// conversation is owned by exactly one user. If it already has live sockets
+	// owned by a DIFFERENT user, refuse — otherwise the core's reply (addressed
+	// by the raw conversation id) would fan out to that other user's sockets.
+	// No live socket → no set → nothing to leak to, so a job may still inject
+	// into a currently-disconnected conversation of its own owner.
+	if owner, ok := c.conversationOwner(body.ConversationID); ok && owner != entityID {
+		slog.Warn("websocket channel: inject refused — conversation owned by another user", "conversation_id", body.ConversationID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	meta := map[string]string{"profile_token": body.Token}
+	if body.ResumeIntent != "" {
+		meta[pkg.ResumeIntentMetadataKey] = body.ResumeIntent
+	}
+	if body.Visibility != "" {
+		meta["visibility"] = body.Visibility
+	}
+	msg := pkg.InboundMessage{
+		ChannelID:      ID,
+		ConversationID: body.ConversationID,
+		SenderID:       body.ConversationID,
+		Content:        body.Content,
+		Metadata:       meta,
+		Timestamp:      time.Now(),
+	}
+
+	select {
+	case c.inbox <- msg:
+		w.WriteHeader(http.StatusAccepted)
+	case <-r.Context().Done():
+		http.Error(w, "request cancelled", http.StatusRequestTimeout)
+	case <-time.After(writeTimeout):
+		http.Error(w, "channel busy", http.StatusServiceUnavailable)
+	}
 }
 
 // handleUpgrade upgrades an HTTP request to a WebSocket connection.
@@ -451,6 +539,11 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 			c.broadcastUserInput(convID, cn, frame.Content)
 		}
 
+		// Visibility is NOT read from the client frame: hiding a turn from the
+		// audited transcript is a privileged capability reserved for the trusted
+		// server-to-server /inject path (handleInject sets it there). Honoring a
+		// browser-supplied visibility would let a user feed model-directed
+		// content while keeping it out of the transcript and their sibling tabs.
 		meta := map[string]string{"profile_token": token}
 		if resumeIntent {
 			// Signal to the core handler: this conversation_id came from the
@@ -545,6 +638,21 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 	if len(set.conns) == 0 {
 		delete(c.conns, convID)
 	}
+}
+
+// conversationOwner returns the entity that owns convID and whether any live
+// socket set currently exists for it. Used by the inject handler to refuse a
+// cross-user delivery: the fan-out in Send is keyed by the raw conversation id
+// and relies on every set being single-owner (pinned at upgrade), so inject
+// must honour that same invariant rather than trusting the caller's id.
+func (c *Channel) conversationOwner(convID string) (string, bool) {
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
+	set, ok := c.conns[convID]
+	if !ok {
+		return "", false
+	}
+	return set.ownerEntityID, true
 }
 
 // targets returns a snapshot of the live sockets for convID. The caller writes

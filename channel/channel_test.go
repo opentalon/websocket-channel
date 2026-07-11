@@ -214,11 +214,141 @@ func testServerWithUsers(t *testing.T, mapping map[string]string) (*Channel, <-c
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ch.handleUpgrade)
+	mux.HandleFunc("/ws/inject", ch.handleInject)
 	srv := httptest.NewServer(mux)
 
 	return ch, inbox, srv, func() {
 		srv.Close()
 		_ = ch.Stop()
+	}
+}
+
+func TestHandleInject_pushesHiddenMessageToInbox(t *testing.T) {
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	body := `{"token":"u1","conversation_id":"conv1","content":"[system] job done","visibility":"hidden","resume_intent":"true"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST inject: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	select {
+	case msg := <-inbox:
+		if msg.ConversationID != "conv1" {
+			t.Errorf("ConversationID = %q, want conv1", msg.ConversationID)
+		}
+		if msg.Content != "[system] job done" {
+			t.Errorf("Content = %q", msg.Content)
+		}
+		if msg.Metadata["visibility"] != "hidden" {
+			t.Errorf("visibility = %q, want hidden", msg.Metadata["visibility"])
+		}
+		if msg.Metadata[pkg.ResumeIntentMetadataKey] != "true" {
+			t.Errorf("resume_intent = %q, want true", msg.Metadata[pkg.ResumeIntentMetadataKey])
+		}
+		if msg.Metadata["profile_token"] != "u1" {
+			t.Errorf("profile_token = %q, want u1", msg.Metadata["profile_token"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no message pushed to inbox")
+	}
+}
+
+// TestHandleInject_ownershipGate is the security boundary: a token resolving to
+// user u2 must NOT inject into a conversation whose live sockets are owned by
+// u1 (else the core's reply, addressed by the raw conversation id, would fan out
+// to u1's sockets). The conversation's own owner is still accepted.
+func TestHandleInject_ownershipGate(t *testing.T) {
+	ch, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	// u1 owns "conv1": register a live socket under it (default whoami maps a
+	// token to its own entity, so "u1" is entity u1).
+	if err := ch.addConn("conv1", "u1", &wsConn{}); err != nil {
+		t.Fatalf("addConn: %v", err)
+	}
+
+	// A foreign user (u2) is refused with 403 and never reaches the core.
+	foreign := `{"token":"u2","conversation_id":"conv1","content":"[system] x"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(foreign))
+	if err != nil {
+		t.Fatalf("POST foreign: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign inject: status = %d, want 403", resp.StatusCode)
+	}
+	select {
+	case msg := <-inbox:
+		t.Fatalf("foreign inject must not reach the core, got %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The conversation's own owner (u1) is still accepted even with a live socket.
+	own := `{"token":"u1","conversation_id":"conv1","content":"[system] job done"}`
+	resp2, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(own))
+	if err != nil {
+		t.Fatalf("POST own: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("owner inject: status = %d, want 202", resp2.StatusCode)
+	}
+	select {
+	case <-inbox: // good, enqueued
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner inject did not reach the core")
+	}
+}
+
+func TestHandleInject_rejectsBadTokenAndMissingFields(t *testing.T) {
+	// Token "" resolves to entity_id "" → whoami 404 → unauthorized.
+	_, _, srv, cleanup := testServerWithUsers(t, map[string]string{"bad": ""})
+	defer cleanup()
+
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json",
+		strings.NewReader(`{"token":"bad","conversation_id":"c","content":"x"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("bad token: status = %d, want 401", resp.StatusCode)
+	}
+
+	resp2, err := http.Post(srv.URL+"/ws/inject", "application/json",
+		strings.NewReader(`{"token":"u1","conversation_id":"c"}`)) // no content
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Errorf("missing content: status = %d, want 400", resp2.StatusCode)
+	}
+
+	// Any non-POST method is rejected before touching the body or the resolver.
+	respGet, err := http.Get(srv.URL + "/ws/inject")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_ = respGet.Body.Close()
+	if respGet.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET: status = %d, want 405", respGet.StatusCode)
+	}
+
+	// A malformed JSON body is rejected with 400.
+	respBad, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(`{not json`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = respBad.Body.Close()
+	if respBad.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed body: status = %d, want 400", respBad.StatusCode)
 	}
 }
 
@@ -468,6 +598,37 @@ func TestSend_typingIndicator(t *testing.T) {
 	}
 	if out.Content != "" {
 		t.Errorf("typing frame should have empty content, got %q", out.Content)
+	}
+}
+
+// TestInbound_clientVisibilityIsIgnored is the security regression guard: a
+// browser frame that sets visibility=hidden must NOT be honored — hiding a turn
+// from the audited transcript is reserved for the trusted /inject path. The
+// forwarded message must carry no visibility metadata.
+func TestInbound_clientVisibilityIsIgnored(t *testing.T) {
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL(srv, "tok"), nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
+
+	// Raw frame carrying a visibility field a client must not be able to set.
+	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"content":"sneaky","visibility":"hidden"}`))
+
+	select {
+	case msg := <-inbox:
+		if v, ok := msg.Metadata["visibility"]; ok {
+			t.Errorf("client visibility was honored: metadata[visibility]=%q, want absent", v)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for inbound message")
 	}
 }
 
