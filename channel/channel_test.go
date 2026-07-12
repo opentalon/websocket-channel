@@ -306,6 +306,69 @@ func TestHandleInject_ownershipGate(t *testing.T) {
 	}
 }
 
+// TestHandleInject_normalizesFullSessionKey: a backend that only persisted the
+// fully-namespaced session key ("<entity>:<channel>:<conversation_id>") can pass
+// it verbatim as conversation_id. The handler reduces it to the raw id the core
+// and the socket registry expect — otherwise the core re-prepends the
+// "<entity>:<channel>:" prefix a second time and the resume misses the session.
+func TestHandleInject_normalizesFullSessionKey(t *testing.T) {
+	_, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	// token "u1" → entity "u1", so the canonical session key is "u1:websocket:conv1".
+	body := `{"token":"u1","conversation_id":"u1:websocket:conv1","content":"[system] job done","resume_intent":"true"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST inject: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	select {
+	case msg := <-inbox:
+		if msg.ConversationID != "conv1" {
+			t.Errorf("ConversationID = %q, want conv1 (raw id, not the full session key)", msg.ConversationID)
+		}
+		if msg.SenderID != "conv1" {
+			t.Errorf("SenderID = %q, want conv1", msg.SenderID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no message pushed to inbox")
+	}
+}
+
+// TestHandleInject_ownershipGateHonorsFullSessionKey guards the gate against the
+// namespaced form: passing the full session key must not let a foreign user slip
+// past (before normalization the gate looked up the full string, found no set
+// keyed by it, and was silently skipped). Normalization makes the gate see the
+// raw id and refuse.
+func TestHandleInject_ownershipGateHonorsFullSessionKey(t *testing.T) {
+	ch, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+
+	if err := ch.addConn("conv1", "u1", &wsConn{}); err != nil {
+		t.Fatalf("addConn: %v", err)
+	}
+
+	// u2 addresses u1's conversation by its full session key — still refused.
+	foreign := `{"token":"u2","conversation_id":"u1:websocket:conv1","content":"[system] x"}`
+	resp, err := http.Post(srv.URL+"/ws/inject", "application/json", strings.NewReader(foreign))
+	if err != nil {
+		t.Fatalf("POST foreign: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign inject via full key: status = %d, want 403", resp.StatusCode)
+	}
+	select {
+	case msg := <-inbox:
+		t.Fatalf("foreign inject must not reach the core, got %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestHandleInject_rejectsBadTokenAndMissingFields(t *testing.T) {
 	// Token "" resolves to entity_id "" → whoami 404 → unauthorized.
 	_, _, srv, cleanup := testServerWithUsers(t, map[string]string{"bad": ""})
