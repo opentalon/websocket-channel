@@ -19,7 +19,7 @@
 //
 // The authoritative definition of the owner-key contract (including the
 // empty=fail-open semantics) is the orchestrator's
-// pkg/channel.OwnerEntityMetadataKey; ownerEntityMetadataKey below mirrors it.
+// pkg/channel.OwnerEntityMetadataKey, imported below.
 
 package wschannel
 
@@ -37,14 +37,6 @@ import (
 // to and subscribes to. A frame published by the pod that generated a reply is
 // picked up by the pod holding the user's socket, which delivers it.
 const fanoutChannel = "opentalon:ws:fanout"
-
-// ownerEntityMetadataKey mirrors the core's
-// github.com/opentalon/opentalon/pkg/channel.OwnerEntityMetadataKey — the
-// authoritative definition of the owner-gate contract, including the
-// empty=fail-open semantics. It is kept as a literal (not the pkg constant)
-// because the currently-pinned core module version does not export it yet;
-// swap to the import when the core pin is next bumped.
-const ownerEntityMetadataKey = "_owner_entity"
 
 // fanoutEnvelope is the JSON published for one outbound frame. Frame carries the
 // already-filtered client bytes (buildFrame output) verbatim, so a subscriber
@@ -139,7 +131,7 @@ func (c *Channel) publish(msg pkg.OutboundMessage, frame []byte) {
 	}
 	env := fanoutEnvelope{
 		Origin:         c.origin,
-		Owner:          msg.Metadata[ownerEntityMetadataKey],
+		Owner:          msg.Metadata[pkg.OwnerEntityMetadataKey],
 		ConversationID: msg.ConversationID,
 		Frame:          json.RawMessage(frame),
 	}
