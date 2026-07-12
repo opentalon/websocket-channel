@@ -33,7 +33,22 @@ channels:
       path: "/ws"             # WebSocket endpoint path
       cors_origins:           # allowed origins (omit to allow all — dev only)
         - "https://mysite.com"
+      redis_url: "redis://redis:6379/0"  # optional: cross-pod fan-out (omit for single-pod)
 ```
+
+### Multi-pod deployments
+
+By default (no `redis_url`) the channel delivers replies only to sockets on its
+own pod — fine for a single-pod deployment. When the orchestrator runs on
+several pods, a reply may be generated on a different pod than the one holding
+the user's browser socket. Set `redis_url` (pointing at the same Redis the
+orchestrator uses) to fan replies out across pods over Redis pub/sub: every pod
+publishes its outbound frames and every pod delivers the ones addressed to a
+socket it holds. Delivery is owner-gated — a pod only delivers a frame whose
+resolved owner matches the local socket's owner. An envelope without an owner
+(e.g. published by a core version that predates owner stamping) is delivered
+without the gate, so mixed-version rollouts degrade gracefully rather than
+dropping messages.
 
 ## Wire protocol
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1211,6 +1212,335 @@ func TestWhoamiResolver_resolve(t *testing.T) {
 			t.Errorf("X-Security-Token = %q, want \"from-env\" (env fallback)", gotSecret)
 		}
 	})
+}
+
+// ── cross-pod fan-out ─────────────────────────────────────────────────────────
+
+// memFanout is an in-process fanoutBus for tests: Publish delivers the payload
+// to every live subscription, no Redis required. It lets the fan-out path be
+// exercised end-to-end (publish → subscribe goroutine → local delivery).
+type memFanout struct {
+	mu   sync.Mutex
+	subs map[*memSub]struct{}
+}
+
+func newMemFanout() *memFanout { return &memFanout{subs: make(map[*memSub]struct{})} }
+
+func (m *memFanout) Publish(_ context.Context, payload []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for s := range m.subs {
+		cp := append([]byte(nil), payload...)
+		select {
+		case s.out <- cp:
+		default: // buffer full: drop, like a best-effort bus
+		}
+	}
+	return nil
+}
+
+func (m *memFanout) Subscribe(_ context.Context) (fanoutSub, error) {
+	s := &memSub{bus: m, out: make(chan []byte, 64)}
+	m.mu.Lock()
+	m.subs[s] = struct{}{}
+	m.mu.Unlock()
+	return s, nil
+}
+
+func (m *memFanout) Close() error { return nil }
+
+type memSub struct {
+	bus  *memFanout
+	out  chan []byte
+	once sync.Once
+}
+
+func (s *memSub) Messages() <-chan []byte { return s.out }
+
+func (s *memSub) Close() error {
+	s.once.Do(func() {
+		s.bus.mu.Lock()
+		delete(s.bus.subs, s)
+		s.bus.mu.Unlock()
+		close(s.out)
+	})
+	return nil
+}
+
+// captureFanout is a memFanout that additionally records every published
+// payload, so a test can assert on the exact envelope Send publishes.
+type captureFanout struct {
+	*memFanout
+	pubMu     sync.Mutex
+	published [][]byte
+}
+
+func newCaptureFanout() *captureFanout { return &captureFanout{memFanout: newMemFanout()} }
+
+func (c *captureFanout) Publish(ctx context.Context, payload []byte) error {
+	c.pubMu.Lock()
+	c.published = append(c.published, append([]byte(nil), payload...))
+	c.pubMu.Unlock()
+	return c.memFanout.Publish(ctx, payload)
+}
+
+func (c *captureFanout) captured() [][]byte {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
+	out := make([][]byte, len(c.published))
+	copy(out, c.published)
+	return out
+}
+
+// testServerWithFanout is testServerWithUsers with cross-pod fan-out wired to an
+// injected (in-memory) bus and the subscribe goroutine running, so a test can
+// publish envelopes and observe local delivery.
+func testServerWithFanout(t *testing.T, mapping map[string]string, bus fanoutBus) (*Channel, <-chan pkg.InboundMessage, *httptest.Server, func()) {
+	t.Helper()
+	ch, inbox, srv, cleanup := testServerWithUsers(t, mapping)
+	ch.fanout = bus
+	if err := ch.startFanout(context.Background()); err != nil {
+		t.Fatalf("startFanout: %v", err)
+	}
+	return ch, inbox, srv, cleanup
+}
+
+// publishEnvelope marshals and publishes a fan-out envelope carrying a minimal
+// content frame for convID.
+func publishEnvelope(t *testing.T, bus fanoutBus, origin, owner, convID, content string) {
+	t.Helper()
+	frame, err := json.Marshal(outboundFrame{ConversationID: convID, Content: content})
+	if err != nil {
+		t.Fatalf("marshal frame: %v", err)
+	}
+	payload, err := json.Marshal(fanoutEnvelope{
+		Origin:         origin,
+		Owner:          owner,
+		ConversationID: convID,
+		Frame:          frame,
+	})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if err := bus.Publish(context.Background(), payload); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+}
+
+func TestSend_fanoutDisabled_deliversLocallyNoPublish(t *testing.T) {
+	// redis_url unset => no fanout: Send still delivers to a local socket, and
+	// there is no publisher to relay to another pod (unchanged behavior).
+	ch, inbox, srv, cleanup := testServer(t)
+	defer cleanup()
+	if ch.fanout != nil {
+		t.Fatal("fanout should be nil when redis_url is unset")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL(srv, "tok"), nil)
+	if err != nil {
+		t.Fatalf("Dial() = %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	readWelcome(t, ctx, conn)
+
+	_ = conn.Write(ctx, websocket.MessageText, mustJSON(t, inboundFrame{Content: "ping"}))
+	var convID string
+	select {
+	case msg := <-inbox:
+		convID = msg.ConversationID
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ping")
+	}
+
+	if err := ch.Send(ctx, pkg.OutboundMessage{ConversationID: convID, Content: "pong"}); err != nil {
+		t.Fatalf("Send() = %v", err)
+	}
+	if got := readContent(t, ctx, conn).Content; got != "pong" {
+		t.Errorf("local content = %q, want \"pong\"", got)
+	}
+}
+
+func TestFanout_matchingOwnerDeliveredToLocalSocket(t *testing.T) {
+	bus := newMemFanout()
+	_, _, srv, cleanup := testServerWithFanout(t, map[string]string{"tabA": "user1"}, bus)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "shared")
+	defer func() { _ = conn.CloseNow() }()
+
+	// A reply generated on ANOTHER pod (different origin) for owner user1.
+	publishEnvelope(t, bus, "other-pod", "user1", "shared", "cross-pod hi")
+
+	if got := readContent(t, ctx, conn).Content; got != "cross-pod hi" {
+		t.Errorf("delivered content = %q, want \"cross-pod hi\"", got)
+	}
+}
+
+func TestFanout_ownerMismatchNotDelivered(t *testing.T) {
+	bus := newMemFanout()
+	ch, _, srv, cleanup := testServerWithFanout(t, map[string]string{"tabA": "user1"}, bus)
+	defer cleanup()
+	_ = ch
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "shared")
+	defer func() { _ = conn.CloseNow() }()
+
+	// The local socket is owned by user1; an envelope owned by user2 must be
+	// dropped — the single-owner boundary holds across pods.
+	publishEnvelope(t, bus, "other-pod", "user2", "shared", "leak")
+
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer shortCancel()
+	if _, _, err := conn.Read(shortCtx); err == nil {
+		t.Error("owner-mismatch frame must not be delivered to the local socket")
+	}
+}
+
+func TestFanout_selfOriginSkipped(t *testing.T) {
+	bus := newMemFanout()
+	ch, _, srv, cleanup := testServerWithFanout(t, map[string]string{"tabA": "user1"}, bus)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "shared")
+	defer func() { _ = conn.CloseNow() }()
+
+	// An envelope stamped with OUR origin is our own publish echoing back; the
+	// origin already delivered it locally, so the subscribe path must skip it.
+	publishEnvelope(t, bus, ch.origin, "user1", "shared", "echo")
+
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer shortCancel()
+	if _, _, err := conn.Read(shortCtx); err == nil {
+		t.Error("self-origin frame must be skipped (already delivered locally)")
+	}
+}
+
+func TestStop_endsSubscribeLoop(t *testing.T) {
+	// The deadlock-sensitive ordering in Stop: the subscribe goroutine ranges
+	// the subscription channel and only returns when Close closes it, so Stop
+	// must close the subscription BEFORE wg.Wait. If that ordering regresses,
+	// Stop never returns — guard with a timeout instead of hanging the suite.
+	ch := New(Config{})
+	ch.fanout = newMemFanout()
+	if err := ch.startFanout(context.Background()); err != nil {
+		t.Fatalf("startFanout: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = ch.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not return: subscribe goroutine must end before wg.Wait")
+	}
+}
+
+func TestSend_publishesOwnerStampedEnvelope(t *testing.T) {
+	// Publish-side owner seam: Send must copy the core-stamped _owner_entity
+	// metadata into the envelope's Owner (a lookup typo here would silently
+	// disable the cross-pod owner gate — an empty Owner is fail-open), while
+	// the client frame inside the envelope must NOT carry the underscore key.
+	bus := newCaptureFanout()
+	ch := New(Config{})
+	ch.fanout = bus
+	if err := ch.startFanout(context.Background()); err != nil {
+		t.Fatalf("startFanout: %v", err)
+	}
+	defer func() { _ = ch.Stop() }()
+
+	err := ch.Send(context.Background(), pkg.OutboundMessage{
+		ConversationID: "c1",
+		Content:        "hi",
+		Metadata:       map[string]string{"_owner_entity": "u1", "type": "answer"},
+	})
+	if err != nil {
+		t.Fatalf("Send() = %v", err)
+	}
+
+	payloads := bus.captured()
+	if len(payloads) != 1 {
+		t.Fatalf("published envelopes = %d, want 1", len(payloads))
+	}
+	var env fanoutEnvelope
+	if err := json.Unmarshal(payloads[0], &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if env.Owner != "u1" {
+		t.Errorf("envelope Owner = %q, want \"u1\"", env.Owner)
+	}
+	if env.ConversationID != "c1" {
+		t.Errorf("envelope ConversationID = %q, want \"c1\"", env.ConversationID)
+	}
+	var f outboundFrame
+	if err := json.Unmarshal(env.Frame, &f); err != nil {
+		t.Fatalf("unmarshal frame: %v", err)
+	}
+	if _, present := f.Metadata["_owner_entity"]; present {
+		t.Error("_owner_entity must be stripped from the client frame inside the envelope")
+	}
+	if f.Metadata["type"] != "answer" {
+		t.Errorf("frame type = %q, want \"answer\"", f.Metadata["type"])
+	}
+}
+
+func TestBuildFrame_stripsInternalMetadata(t *testing.T) {
+	ch := New(Config{})
+	data, err := ch.buildFrame(pkg.OutboundMessage{
+		ConversationID: "c",
+		Content:        "hi",
+		Metadata: map[string]string{
+			"profile_token": "secret",
+			"_owner_entity": "user1",
+			"_typing":       "true",
+			"type":          "confirmation",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildFrame: %v", err)
+	}
+	var f outboundFrame
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := f.Metadata["profile_token"]; present {
+		t.Error("profile_token must be stripped from the client frame")
+	}
+	if _, present := f.Metadata["_owner_entity"]; present {
+		t.Error("_owner_entity must be stripped from the client frame")
+	}
+	if _, present := f.Metadata["_typing"]; present {
+		t.Error("_typing must be stripped from the client frame")
+	}
+	if f.Metadata["type"] != "confirmation" {
+		t.Errorf("type = %q, want \"confirmation\" (non-internal keys pass through)", f.Metadata["type"])
+	}
+	if !f.Typing {
+		t.Error("_typing=true should set the Typing flag on the frame")
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return data
 }
 
 func TestConnRegistry_lastSocketDeletesBucket(t *testing.T) {
