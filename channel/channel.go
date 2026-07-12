@@ -309,6 +309,11 @@ func (c *Channel) Stop() error {
 // a different user, the inject is refused (403). A conversation with no live
 // socket has nothing to fan out to, so a background job may still inject into a
 // currently-disconnected conversation of its own owner.
+//
+// conversation_id may be either the raw conversation id or the fully-namespaced
+// session key ("<entity>:<channel>:<conversation_id>"); it is reduced to the raw
+// id before use (see below), so a backend that only persisted the canonical
+// session key can address the conversation without knowing the id encoding.
 func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -339,14 +344,29 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Normalise to the RAW conversation id. A caller may address the
+	// conversation by the fully-namespaced session key
+	// ("<entity>:<channel>:<conversation_id>" — the canonical id a backend
+	// persists for support/analytics) instead of the raw conversation id.
+	// Both the ownership gate (c.conns is keyed by the raw id) and the core
+	// (which re-prepends the "<entity>:<channel>:" prefix to form the session
+	// key) require the raw id: a full key skips the gate and double-namespaces
+	// the session, so the resume misses and the inject is silently dropped.
+	// The raw id is the right-most segment (the core's own split-from-right
+	// convention); a raw id carries no separator and passes through unchanged.
+	convID := body.ConversationID
+	if i := strings.LastIndex(convID, ":"); i >= 0 {
+		convID = convID[i+1:]
+	}
+
 	// Ownership gate, mirroring the socket upgrade's errOwnerMismatch: a
 	// conversation is owned by exactly one user. If it already has live sockets
 	// owned by a DIFFERENT user, refuse — otherwise the core's reply (addressed
 	// by the raw conversation id) would fan out to that other user's sockets.
 	// No live socket → no set → nothing to leak to, so a job may still inject
 	// into a currently-disconnected conversation of its own owner.
-	if owner, ok := c.conversationOwner(body.ConversationID); ok && owner != entityID {
-		slog.Warn("websocket channel: inject refused — conversation owned by another user", "conversation_id", body.ConversationID)
+	if owner, ok := c.conversationOwner(convID); ok && owner != entityID {
+		slog.Warn("websocket channel: inject refused — conversation owned by another user", "conversation_id", convID)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -360,8 +380,8 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := pkg.InboundMessage{
 		ChannelID:      ID,
-		ConversationID: body.ConversationID,
-		SenderID:       body.ConversationID,
+		ConversationID: convID,
+		SenderID:       convID,
 		Content:        body.Content,
 		Metadata:       meta,
 		Timestamp:      time.Now(),
