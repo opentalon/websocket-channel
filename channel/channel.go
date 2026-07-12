@@ -33,9 +33,12 @@ const (
 	controlResumeHello = "resume_hello"
 )
 
-// writeTimeout bounds a single fan-out write so one stuck socket (e.g. a
-// half-open TCP connection after a laptop sleep) cannot delay delivery to a
-// user's other connections beyond this bound.
+// writeTimeout bounds every externally-blocking step of message delivery:
+// a single socket write (deliverLocal, broadcastUserInput) so one stuck socket
+// (e.g. a half-open TCP connection after a laptop sleep) cannot delay delivery
+// to a user's other connections; the Redis publish deadline in the cross-pod
+// fan-out (publish in fanout.go); and the inject handler's bounded wait for a
+// free inbox slot (handleInject).
 const writeTimeout = 5 * time.Second
 
 // Config holds the WebSocket server configuration.
@@ -52,6 +55,15 @@ type Config struct {
 	// (inherited from the core process), so the secret need not be duplicated in
 	// the plugin config alongside the core's own profiles.who_am_i block.
 	WhoamiSecret string
+	// RedisURL enables cross-pod fan-out. A reply is generated on whichever pod
+	// runs the orchestrator, which is not necessarily the pod holding the user's
+	// browser socket. When set, every outbound frame is also published to a Redis
+	// pub/sub channel that every pod subscribes to, so the pod that owns the
+	// socket delivers it. Empty/unset = disabled: the channel behaves exactly as
+	// before, delivering only to sockets on this same pod. This channel runs as
+	// its own subprocess, so it opens its own Redis client rather than sharing the
+	// core's.
+	RedisURL string
 }
 
 type wsConn struct {
@@ -84,6 +96,15 @@ type Channel struct {
 	stopMu  sync.Mutex
 	stopped bool
 	wg      sync.WaitGroup
+
+	// Cross-pod fan-out (nil unless RedisURL is configured). origin is a
+	// process-lifetime-unique id used to skip our own published frames (we
+	// already delivered them locally). fanout is the pub/sub seam; sub is the
+	// live subscription drained by the subscribe goroutine. A test can inject a
+	// fake fanout before startFanout to exercise the path without a real Redis.
+	origin string
+	fanout fanoutBus
+	sub    fanoutSub
 }
 
 // inboundFrame is the JSON structure for client → server messages. A client
@@ -146,6 +167,9 @@ func (c *Channel) Configure(config map[string]interface{}) error {
 	}
 	if v, ok := config["whoami_secret"].(string); ok && v != "" {
 		c.cfg.WhoamiSecret = v
+	}
+	if v, ok := config["redis_url"].(string); ok && v != "" {
+		c.cfg.RedisURL = v
 	}
 	return nil
 }
@@ -213,23 +237,48 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 		_ = c.srv.Shutdown(shutCtx)
 	}()
 
+	// Cross-pod fan-out is best-effort: if it cannot be established the channel
+	// still serves sockets on this pod exactly as before, so a Redis outage never
+	// keeps the process from starting. There is no boot retry BY DESIGN — a
+	// misconfigured redis_url must fail loudly at boot (hence Error, not Warn),
+	// and a transient boot race only degrades this pod to local-only delivery
+	// until its next restart, while the client-side transcript catch-up
+	// independently covers any missed live pushes.
+	if err := c.startFanout(ctx); err != nil {
+		slog.Error("websocket channel: cross-pod fan-out disabled", "error", err)
+	}
+
 	slog.Info("websocket channel: listening", "addr", c.cfg.Addr, "path", c.cfg.Path)
 	return nil
 }
 
 // Send implements pkg.Channel. It delivers a response to the WebSocket client
 // identified by msg.ConversationID. Safe for concurrent use.
+//
+// Order matters: build the client frame once, deliver it to sockets on THIS pod,
+// then publish it for other pods. Local delivery happens before publish, so a
+// down or slow Redis degrades to exactly the old local-only behavior.
 func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
-	typing := msg.Metadata["_typing"] == "true"
-	targets := c.targets(msg.ConversationID)
-	slog.Debug("websocket Send", "conv", msg.ConversationID, "content_len", len(msg.Content), "typing", typing, "sockets", len(targets))
-	if len(targets) == 0 {
-		return nil // no live connection for this conversation
+	frame, err := c.buildFrame(msg)
+	if err != nil {
+		return fmt.Errorf("marshal response: %w", err)
 	}
-	// Filter out internal metadata keys before forwarding to the client.
+	c.deliverLocal(ctx, msg.ConversationID, frame)
+	c.publish(msg, frame)
+	return nil
+}
+
+// buildFrame filters internal metadata and marshals the client-ready bytes.
+// Stripped: profile_token and every key with a leading underscore (_typing,
+// which becomes the Typing flag, and _owner_entity, which is the core-stamped
+// owner used only for cross-pod gating). Returning the marshalled bytes here —
+// shared by both local delivery and the published envelope — is what guarantees
+// a remote pod writes byte-identical frames with no internal leak.
+func (c *Channel) buildFrame(msg pkg.OutboundMessage) ([]byte, error) {
+	typing := msg.Metadata["_typing"] == "true"
 	var meta map[string]string
 	for k, v := range msg.Metadata {
-		if k == "_typing" || k == "profile_token" {
+		if k == "profile_token" || strings.HasPrefix(k, "_") {
 			continue
 		}
 		if meta == nil {
@@ -243,29 +292,31 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 		Metadata:       meta,
 		Typing:         typing,
 	}
-	data, err := json.Marshal(frame)
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
-	}
-	// Fan out to every live socket the user has open on this conversation.
-	// Writes are sequential because each socket requires serialized writes, but
-	// each is bounded by writeTimeout so one stuck socket delays the rest by at
-	// most that bound rather than blocking the fan-out indefinitely; writes to
-	// distinct sockets never contend (separate wsConn.mu). A failed or timed-out
-	// write is logged but never aborts delivery to the others — that socket's
-	// readLoop observes the same break and unregisters it via its defer, so
-	// removal stays single-sourced (no double bookkeeping here).
+	return json.Marshal(frame)
+}
+
+// deliverLocal fans the already-built frame out to every live socket this pod
+// holds for convID. A no-op when the conversation has no local socket (its
+// sockets may live on another pod, which delivers via the fan-out subscription).
+// Writes are sequential because each socket requires serialized writes, but each
+// is bounded by writeTimeout so one stuck socket delays the rest by at most that
+// bound rather than blocking indefinitely; writes to distinct sockets never
+// contend (separate wsConn.mu). A failed or timed-out write is logged but never
+// aborts delivery to the others — that socket's readLoop observes the same break
+// and unregisters it via its defer, so removal stays single-sourced.
+func (c *Channel) deliverLocal(ctx context.Context, convID string, frame []byte) {
+	targets := c.targets(convID)
+	slog.Debug("websocket deliverLocal", "conv", convID, "sockets", len(targets))
 	for _, cn := range targets {
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 		cn.mu.Lock()
-		werr := cn.ws.Write(wctx, websocket.MessageText, data)
+		werr := cn.ws.Write(wctx, websocket.MessageText, frame)
 		cn.mu.Unlock()
 		cancel()
 		if werr != nil {
-			slog.Debug("websocket Send: write failed", "conv", msg.ConversationID, "error", werr)
+			slog.Debug("websocket deliverLocal: write failed", "conv", convID, "error", werr)
 		}
 	}
-	return nil
 }
 
 // SendAndCapture implements pkg.UpdatableChannel. Returns an error so
@@ -294,7 +345,16 @@ func (c *Channel) Stop() error {
 	c.stopMu.Lock()
 	c.stopped = true
 	c.stopMu.Unlock()
+	// Close the subscription BEFORE waiting: the subscribe goroutine ranges the
+	// pub/sub channel and only returns when that channel closes, so Wait would
+	// deadlock if it blocked on the goroutine first.
+	if c.sub != nil {
+		_ = c.sub.Close()
+	}
 	c.wg.Wait()
+	if c.fanout != nil {
+		_ = c.fanout.Close()
+	}
 	return nil
 }
 
@@ -308,7 +368,10 @@ func (c *Channel) Stop() error {
 // as the socket upgrade: if the conversation already has live sockets owned by
 // a different user, the inject is refused (403). A conversation with no live
 // socket has nothing to fan out to, so a background job may still inject into a
-// currently-disconnected conversation of its own owner.
+// currently-disconnected conversation of its own owner. That "nothing to leak
+// to" reasoning holds PER-POD — this handler only sees this pod's sockets; a
+// socket on another pod is protected by the receiving pod's own owner gate in
+// the cross-pod subscribe loop (see subscribeLoop in fanout.go).
 //
 // conversation_id may be either the raw conversation id or the fully-namespaced
 // session key ("<entity>:<channel>:<conversation_id>"); it is reduced to the raw
@@ -364,7 +427,9 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	// owned by a DIFFERENT user, refuse — otherwise the core's reply (addressed
 	// by the raw conversation id) would fan out to that other user's sockets.
 	// No live socket → no set → nothing to leak to, so a job may still inject
-	// into a currently-disconnected conversation of its own owner.
+	// into a currently-disconnected conversation of its own owner. This check
+	// only covers sockets on THIS pod; sockets on other pods are covered by the
+	// receiving pod's owner gate in the cross-pod subscribe loop.
 	if owner, ok := c.conversationOwner(convID); ok && owner != entityID {
 		slog.Warn("websocket channel: inject refused — conversation owned by another user", "conversation_id", convID)
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -664,7 +729,10 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 // socket set currently exists for it. Used by the inject handler to refuse a
 // cross-user delivery: the fan-out in Send is keyed by the raw conversation id
 // and relies on every set being single-owner (pinned at upgrade), so inject
-// must honour that same invariant rather than trusting the caller's id.
+// must honour that same invariant rather than trusting the caller's id. The
+// cross-pod subscribe loop (subscribeLoop) is a second caller: it gates the
+// DELIVERY of a published frame on the same owner, dropping envelopes whose
+// owner does not match the local set's.
 func (c *Channel) conversationOwner(convID string) (string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
