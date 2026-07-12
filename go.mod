@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/coder/websocket v1.8.14
-	github.com/opentalon/opentalon v0.0.19-0.20260606142218-ccc266715660
+	github.com/opentalon/opentalon v0.0.21-0.20260712101126-9a652ec31426
 	github.com/redis/go-redis/v9 v9.18.0
 )
 
