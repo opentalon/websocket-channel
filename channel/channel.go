@@ -67,8 +67,9 @@ type Config struct {
 }
 
 type wsConn struct {
-	ws *websocket.Conn
-	mu sync.Mutex
+	ws      *websocket.Conn
+	mu      sync.Mutex
+	agentID string // optional: scopes the conversation to a specific workflow agent
 }
 
 // connSet holds every live socket for one conversation. All of them are owned
@@ -511,7 +512,10 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		convID = newID()
 	}
 	resumeIntent := clientConvID != ""
-	cn := &wsConn{ws: ws}
+	// Optional: scope this conversation to a specific workflow agent. Carried
+	// through to Core in the message metadata so it can ground the turn on that
+	// agent instead of the general assistant.
+	cn := &wsConn{ws: ws, agentID: r.URL.Query().Get("agent_id")}
 
 	// Register the socket in its conversation's set. A conversation is owned by
 	// exactly one user; multiple connections of THAT user (several tabs/windows)
@@ -649,6 +653,11 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 			if action, _ := frame.Metadata["action"].(string); action != "" {
 				meta["confirmation"] = action
 			}
+		}
+		// Scope the turn to a workflow agent when the socket was opened with
+		// ?agent_id=… (Timly AI Workflows chat). Core grounds the turn on it.
+		if cn.agentID != "" {
+			meta["agent_id"] = cn.agentID
 		}
 		msg := pkg.InboundMessage{
 			ChannelID:      ID,
