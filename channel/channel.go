@@ -27,9 +27,10 @@ type Config struct {
 }
 
 type wsConn struct {
-	ws    *websocket.Conn
-	mu    sync.Mutex
-	token string // profile token that created this conversation (for reconnect auth)
+	ws      *websocket.Conn
+	mu      sync.Mutex
+	token   string // profile token that created this conversation (for reconnect auth)
+	agentID string // optional: scopes the conversation to a specific workflow agent
 }
 
 // Channel is a WebSocket server channel. Browser clients connect to it with a
@@ -60,7 +61,7 @@ type fileFrame struct {
 type outboundFrame struct {
 	ConversationID string            `json:"conversation_id"`
 	Content        string            `json:"content"`
-	Metadata       map[string]string `json:"metadata,omitempty"` // pass-through from core (e.g. type=confirmation, options=approve,reject)
+	Metadata       map[string]string `json:"metadata,omitempty"`  // pass-through from core (e.g. type=confirmation, options=approve,reject)
 	Streaming      bool              `json:"streaming,omitempty"` // true while LLM is still generating; false (or absent) = final message
 	Done           bool              `json:"done,omitempty"`      // true on the last streaming frame
 	Typing         bool              `json:"typing,omitempty"`    // true for keepalive typing-indicator frames (no content)
@@ -250,7 +251,11 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	if convID == "" {
 		convID = newID()
 	}
-	cn := &wsConn{ws: ws}
+	// Optional: scope this conversation to a specific workflow agent. Carried
+	// through to Core in the message metadata so it can ground the turn on that
+	// agent instead of the general assistant.
+	agentID := r.URL.Query().Get("agent_id")
+	cn := &wsConn{ws: ws, agentID: agentID}
 
 	// If an old connection exists for this convID, verify the token matches
 	// (prevent session hijacking) and close the stale connection.
@@ -296,10 +301,10 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("websocket channel: client connected", "conversation_id", convID, "reconnect", r.URL.Query().Get("conversation_id") != "")
 
-	c.readLoop(r.Context(), ws, convID, token)
+	c.readLoop(r.Context(), ws, convID, token, agentID)
 }
 
-func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, token string) {
+func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, token, agentID string) {
 	for {
 		_, data, err := ws.Read(ctx)
 		if err != nil {
@@ -315,12 +320,16 @@ func (c *Channel) readLoop(ctx context.Context, ws *websocket.Conn, convID, toke
 			continue
 		}
 
+		meta := map[string]string{"profile_token": token}
+		if agentID != "" {
+			meta["agent_id"] = agentID
+		}
 		msg := pkg.InboundMessage{
 			ChannelID:      ID,
 			ConversationID: convID,
 			SenderID:       convID,
 			Content:        frame.Content,
-			Metadata:       map[string]string{"profile_token": token},
+			Metadata:       meta,
 			Timestamp:      time.Now(),
 		}
 
