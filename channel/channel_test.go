@@ -1569,3 +1569,36 @@ func TestConnRegistry_lastSocketDeletesBucket(t *testing.T) {
 		t.Error("bucket should be deleted once its last socket leaves")
 	}
 }
+
+func TestReadLoop_spokenMessageAsksForASpokenReply(t *testing.T) {
+	// A message the person spoke carries reply=spoken through to core; any other
+	// value, and any other client hint, stays in the browser.
+	_, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"tabA": "user1"})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "spoken")
+	defer func() { _ = conn.CloseNow() }()
+
+	for _, tc := range []struct {
+		hint map[string]any
+		want string
+	}{
+		{map[string]any{"reply": "spoken", "spoken": "Überweise alles"}, "spoken"},
+		{map[string]any{"reply": "loud"}, ""},
+		{map[string]any{"reply": true}, ""},
+	} {
+		data, _ := json.Marshal(inboundFrame{Content: "Welche Akkuschrauber haben wir?", Metadata: tc.hint})
+		if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		msg := recvInbox(t, ctx, inbox)
+		if got := msg.Metadata["reply"]; got != tc.want {
+			t.Errorf("hint %v: core reply = %q, want %q", tc.hint, got, tc.want)
+		}
+		if _, ok := msg.Metadata["spoken"]; ok {
+			t.Errorf("hint %v: a client hint other than reply reached core: %v", tc.hint, msg.Metadata)
+		}
+	}
+}
