@@ -162,8 +162,8 @@ twice) or the note key was already stored.
 | `504` | no answer within 10 seconds; retry with the same key |
 
 The assistant's reply goes to the session's conversation like any reply: to
-the sockets that hold it, never to another conversation's. A client that
-attaches later reads it from the session's history.
+the sockets that hold it, never to another conversation's or another user's. A
+client that attaches later reads it from the session's history.
 
 ## Demo
 

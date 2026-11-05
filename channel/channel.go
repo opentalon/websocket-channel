@@ -292,6 +292,12 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 //
 // The core's answer to an open request never reaches a socket: it goes to the
 // request waiting on this pod, or is published for the pod that holds it.
+//
+// Local delivery is owner-gated like the cross-pod subscriber (see
+// subscribeLoop): the core addresses a frame by the raw conversation id, and a
+// socket set of another user may hold that id on this pod, e.g. when a server
+// continues a session whose owner has no socket here. An empty owner is not
+// gated.
 func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 	frame, err := c.buildFrame(msg)
 	if err != nil {
@@ -303,7 +309,13 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 		}
 		return nil
 	}
-	c.deliverLocal(ctx, msg.ConversationID, frame)
+	owner := msg.Metadata[pkg.OwnerEntityMetadataKey]
+	if local, ok := c.conversationOwner(msg.ConversationID); ok && owner != "" && local != owner {
+		slog.Warn("websocket channel: owner mismatch, not delivering locally",
+			"conversation_id", msg.ConversationID, "want_owner", local, "got_owner", owner)
+	} else {
+		c.deliverLocal(ctx, msg.ConversationID, frame)
+	}
 	c.publish(msg, frame)
 	return nil
 }
@@ -959,10 +971,10 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 // socket set currently exists for it. Used by the inject handler to refuse a
 // cross-user delivery: the fan-out in Send is keyed by the raw conversation id
 // and relies on every set being single-owner (pinned at upgrade), so inject
-// must honour that same invariant rather than trusting the caller's id. The
-// cross-pod subscribe loop (subscribeLoop) is a second caller: it gates the
-// DELIVERY of a published frame on the same owner, dropping envelopes whose
-// owner does not match the local set's.
+// must honour that same invariant rather than trusting the caller's id. Send
+// and the cross-pod subscribe loop (subscribeLoop) are the other callers: they
+// gate the DELIVERY of a frame on the same owner, dropping frames whose owner
+// does not match the local set's.
 func (c *Channel) conversationOwner(convID string) (string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()

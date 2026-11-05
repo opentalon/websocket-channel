@@ -1929,6 +1929,36 @@ func TestHandleOpen_acrossPods(t *testing.T) {
 	expectTurnFrames(t, ctx, connX)
 }
 
+// A continuation of one user's session never delivers into a socket set of
+// another user that holds the same conversation id on this pod.
+func TestHandleOpen_replyNeverReachesAnotherUsersSocket(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1", "tabOther": "u2"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	other, _ := dialConvID(t, ctx, srv, "tabOther", "c")
+	defer func() { _ = other.CloseNow() }()
+
+	res := postOpen(t, srv, `{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n1","content":"note"}`)
+	msg := recvInbox(t, ctx, inbox)
+	if err := ch.Send(ctx, sessionOpened(msg, msg.ConversationID, "u1:websocket:c", true)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := awaitOpen(t, res); got.status != http.StatusOK {
+		t.Fatalf("answer = %+v, want 200", got)
+	}
+
+	sendTurnFrames(t, ctx, ch, "c")
+	if err := ch.Send(ctx, pkg.OutboundMessage{ConversationID: "c", Content: "own",
+		Metadata: map[string]string{"_owner_entity": "u2"}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if f := readContent(t, ctx, other); f.Content != "own" {
+		t.Errorf("the other user's socket received %+v, want only its own frame", f)
+	}
+}
+
 // sendTurnFrames sends what the core sends after its answer: the opener's
 // reply and a model error, both addressed to the session's conversation and
 // carrying no open_request_id.
