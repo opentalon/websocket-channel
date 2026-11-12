@@ -23,7 +23,8 @@ import (
 const ID = "websocket"
 
 // controlMetadataKey / controlResumeHello mirror the core's
-// pkg/channel.ControlMetadataKey / ControlResumeHello string contract. They are
+// pkg/channel.ControlMetadataKey / ControlResumeHello string contract, and the
+// open* / frame* keys its pkg/channel.OpenSessionMetadataKey contract. They are
 // kept as literals (not the pkg constants) so this plugin keeps building
 // against its currently-pinned core module version — the wire contract is the
 // string value, which the core reads via its own constant. Switch to the pkg
@@ -31,7 +32,27 @@ const ID = "websocket"
 const (
 	controlMetadataKey = "control"
 	controlResumeHello = "resume_hello"
+
+	openSessionMetadataKey   = "open_session"
+	openedByMetadataKey      = "opened_by"
+	openKeyMetadataKey       = "open_key"
+	openSessionIDMetadataKey = "session_id"
+	noteKeyMetadataKey       = "note_key"
+	openRequestIDMetadataKey = "open_request_id"
+
+	frameSessionOpened = "session_opened"
+	frameOpenRejected  = "open_rejected"
 )
+
+// kindSystem is the whoami interaction kind of a backend's system token, the
+// only credential that may open a session for a user (POST {path}/open).
+const kindSystem = "system"
+
+// openAnswerWait bounds POST {path}/open from the request's arrival: the
+// identity lookup, the hand-off to the core and the wait for its answer share
+// it. A caller whose own timeout is longer always receives the answer, or the
+// 503 or 504, before it gives up.
+const openAnswerWait = 10 * time.Second
 
 // writeTimeout bounds every externally-blocking step of message delivery:
 // a single socket write (deliverLocal, broadcastUserInput) so one stuck socket
@@ -106,6 +127,12 @@ type Channel struct {
 	origin string
 	fanout fanoutBus
 	sub    fanoutSub
+
+	// pending holds the open requests waiting for the core's answer:
+	// open_request_id → chan openAnswer. openWait is openAnswerWait; tests
+	// shorten it.
+	pending  sync.Map
+	openWait time.Duration
 }
 
 // inboundFrame is the JSON structure for client → server messages. A client
@@ -143,7 +170,7 @@ func New(cfg Config) *Channel {
 	if cfg.Path == "" {
 		cfg.Path = "/ws"
 	}
-	return &Channel{cfg: cfg, conns: make(map[string]*connSet)}
+	return &Channel{cfg: cfg, conns: make(map[string]*connSet), openWait: openAnswerWait}
 }
 
 // Configure implements pkg.ConfigurableChannel. Called by OpenTalon with the
@@ -217,6 +244,10 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 	// socket: the message is handed to the core, whose reply fans out to the
 	// user's live browser sockets for that conversation.
 	mux.HandleFunc(c.cfg.Path+"/inject", c.handleInject)
+	// Server-side open: a trusted backend opens a chat session for a user, or
+	// continues one, with hidden content the assistant answers, and learns the
+	// session once the core committed it.
+	mux.HandleFunc(c.cfg.Path+"/open", c.handleOpen)
 
 	c.srv = &http.Server{
 		Addr:    c.cfg.Addr,
@@ -259,12 +290,31 @@ func (c *Channel) Start(ctx context.Context, inbox chan<- pkg.InboundMessage) er
 // Order matters: build the client frame once, deliver it to sockets on THIS pod,
 // then publish it for other pods. Local delivery happens before publish, so a
 // down or slow Redis degrades to exactly the old local-only behavior.
+//
+// The core's answer to an open request never reaches a socket: it goes to the
+// request waiting on this pod, or is published for the pod that holds it.
+//
+// Local delivery is owner-gated like the cross-pod subscriber (see
+// subscribeLoop): the core addresses a frame by the raw conversation id, and a
+// socket set of another user may hold that id on this pod, e.g. when a server
+// continues a session whose owner has no socket here. An empty owner is not
+// gated.
 func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 	frame, err := c.buildFrame(msg)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
-	c.deliverLocal(ctx, msg.ConversationID, frame)
+	if requestID := openRequestID(msg.Metadata); requestID != "" {
+		if !c.answerOpen(requestID, openAnswerOf(msg.Metadata)) {
+			c.publish(msg, frame)
+		}
+		return nil
+	}
+	owner := msg.Metadata[pkg.OwnerEntityMetadataKey]
+	if local, ok := c.deliverLocal(ctx, msg.ConversationID, owner, frame); !ok {
+		slog.Warn("websocket channel: owner mismatch, not delivering locally",
+			"conversation_id", msg.ConversationID, "want_owner", local, "got_owner", owner)
+	}
 	c.publish(msg, frame)
 	return nil
 }
@@ -296,17 +346,22 @@ func (c *Channel) buildFrame(msg pkg.OutboundMessage) ([]byte, error) {
 	return json.Marshal(frame)
 }
 
-// deliverLocal fans the already-built frame out to every live socket this pod
-// holds for convID. A no-op when the conversation has no local socket (its
-// sockets may live on another pod, which delivers via the fan-out subscription).
+// deliverLocal fans the already-built frame of owner out to every live socket
+// this pod holds for convID. A no-op when the conversation has no local socket
+// (its sockets may live on another pod, which delivers via the fan-out
+// subscription). When owner is set and the local set belongs to another user it
+// writes nothing and returns that user and false (see recipients).
 // Writes are sequential because each socket requires serialized writes, but each
 // is bounded by writeTimeout so one stuck socket delays the rest by at most that
 // bound rather than blocking indefinitely; writes to distinct sockets never
 // contend (separate wsConn.mu). A failed or timed-out write is logged but never
 // aborts delivery to the others — that socket's readLoop observes the same break
 // and unregisters it via its defer, so removal stays single-sourced.
-func (c *Channel) deliverLocal(ctx context.Context, convID string, frame []byte) {
-	targets := c.targets(convID)
+func (c *Channel) deliverLocal(ctx context.Context, convID, owner string, frame []byte) (string, bool) {
+	targets, local, ok := c.recipients(convID, owner)
+	if !ok {
+		return local, false
+	}
 	slog.Debug("websocket deliverLocal", "conv", convID, "sockets", len(targets))
 	for _, cn := range targets {
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
@@ -318,6 +373,7 @@ func (c *Channel) deliverLocal(ctx context.Context, convID string, frame []byte)
 			slog.Debug("websocket deliverLocal: write failed", "conv", convID, "error", werr)
 		}
 	}
+	return local, true
 }
 
 // SendAndCapture implements pkg.UpdatableChannel. Returns an error so
@@ -401,7 +457,7 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fail closed: an unresolvable token never reaches the core.
-	entityID, err := c.resolver.resolve(r.Context(), body.Token)
+	entityID, _, err := c.resolver.resolve(r.Context(), body.Token)
 	if err != nil {
 		slog.Warn("websocket channel: inject identity resolution failed", "error", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -463,6 +519,220 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleOpen opens a chat session for a user on a trusted backend's request, or
+// continues one with a hidden note, and answers with the session the core
+// committed. A backend POSTs {token, opened_by, open_key, content} to open, or
+// {token, session_id, note_key, content} to continue; visibility and
+// reasoning_effort are forwarded like on /inject. Only a system token may do
+// this, so a browser token never reaches the core with the open metadata.
+//
+// The request reaches the core under a minted conversation id (a session it
+// opens is "<user>:websocket:<conversation>") and a correlation id of its own,
+// which the core echoes on its answer and Send routes here. Neither the
+// conversation nor the key could key the wait: a found or continued session is
+// another conversation, and concurrent attempts may share a key. Without an
+// answer within openWait of the request's arrival the caller gets 504 and may
+// retry with the same key.
+func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
+	// One deadline for the whole request: a wait started after the identity
+	// lookup would answer up to the lookup's duration later than openWait.
+	ctx, cancel := context.WithTimeout(r.Context(), c.openWait)
+	defer cancel()
+	// The context does not reach the body's reads, so a caller stalling in its
+	// body would hold the handler past the deadline: the connection's read
+	// deadline bounds them, from the start, since the server reads an unread
+	// body to its end before it sends any answer, a refusal included. The
+	// whole body is read under it, so the server never waits for an unread
+	// rest after that. Once the body is read the deadline is lifted, or it
+	// would also end the server's own read that notices the caller going away,
+	// and with it the request's context.
+	rc := http.NewResponseController(w)
+	deadline, _ := ctx.Deadline()
+	_ = rc.SetReadDeadline(deadline)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Token           string `json:"token"`
+		OpenedBy        string `json:"opened_by"`
+		OpenKey         string `json:"open_key"`
+		SessionID       string `json:"session_id"`
+		NoteKey         string `json:"note_key"`
+		Content         string `json:"content"`
+		Visibility      string `json:"visibility"`
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		http.Error(w, "no request body within the wait", http.StatusGatewayTimeout)
+		return
+	}
+	if err == nil {
+		_ = rc.SetReadDeadline(time.Time{})
+		err = json.Unmarshal(raw, &body)
+	}
+	if err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	complete := body.Token != "" && body.Content != ""
+	if body.SessionID == "" {
+		complete = complete && body.OpenedBy != "" && body.OpenKey != ""
+	} else {
+		complete = complete && body.NoteKey != ""
+	}
+	if !complete {
+		http.Error(w, "token, content and either opened_by and open_key or session_id and note_key are required", http.StatusBadRequest)
+		return
+	}
+
+	_, kind, err := c.resolver.resolve(ctx, body.Token)
+	if err != nil {
+		// A lookup cut short by the deadline refused no token: the caller may
+		// retry, as on any other 504.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			http.Error(w, "no identity within the wait", http.StatusGatewayTimeout)
+			return
+		}
+		slog.Warn("websocket channel: open identity resolution failed", "error", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if kind != kindSystem {
+		slog.Warn("websocket channel: open refused — not a system token", "kind", kind)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	requestID := newID()
+	answer := make(chan openAnswer, 1)
+	c.pending.Store(requestID, answer)
+	defer c.pending.Delete(requestID)
+
+	meta := map[string]string{
+		"profile_token":          body.Token,
+		openSessionMetadataKey:   "true",
+		openRequestIDMetadataKey: requestID,
+	}
+	if body.SessionID != "" {
+		meta[openSessionIDMetadataKey] = body.SessionID
+		meta[noteKeyMetadataKey] = body.NoteKey
+	} else {
+		meta[openedByMetadataKey] = body.OpenedBy
+		meta[openKeyMetadataKey] = body.OpenKey
+	}
+	if body.Visibility != "" {
+		meta["visibility"] = body.Visibility
+	}
+	if body.ReasoningEffort != "" {
+		meta["reasoning_effort"] = body.ReasoningEffort
+	}
+	convID := newID()
+	msg := pkg.InboundMessage{
+		ChannelID:      ID,
+		ConversationID: convID,
+		SenderID:       convID,
+		Content:        body.Content,
+		Metadata:       meta,
+		Timestamp:      time.Now(),
+	}
+
+	// ctx ends with the deadline or when the caller goes away; only the
+	// deadline gets an answer.
+	select {
+	case c.inbox <- msg:
+	case <-ctx.Done():
+		if r.Context().Err() == nil {
+			http.Error(w, "channel busy", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	select {
+	case a := <-answer:
+		writeOpenAnswer(w, a)
+	case <-ctx.Done():
+		if r.Context().Err() == nil {
+			http.Error(w, "no answer from the core", http.StatusGatewayTimeout)
+		}
+	}
+}
+
+// openAnswer is the core's answer to one open request: the session it opened,
+// found or continued, or the code it refused the request with.
+type openAnswer struct {
+	opened    bool // session_opened; false for open_rejected
+	sessionID string
+	created   bool
+	errorCode string
+}
+
+func openAnswerOf(meta map[string]string) openAnswer {
+	return openAnswer{
+		opened:    meta["type"] == frameSessionOpened,
+		sessionID: meta[openSessionIDMetadataKey],
+		created:   meta["created"] == "true",
+		errorCode: meta["error_code"],
+	}
+}
+
+// openRequestID returns the open request a frame answers, or "" for every
+// other frame. The core puts the correlation id on its session_opened and
+// open_rejected frames only, never on a turn's reply or its error frame.
+func openRequestID(meta map[string]string) string {
+	switch meta["type"] {
+	case frameSessionOpened, frameOpenRejected:
+		return meta[openRequestIDMetadataKey]
+	}
+	return ""
+}
+
+// answerOpen hands a to the open request requestID waiting on this pod. It
+// reports false when no such request waits here.
+func (c *Channel) answerOpen(requestID string, a openAnswer) bool {
+	v, ok := c.pending.Load(requestID)
+	if !ok {
+		return false
+	}
+	select {
+	case v.(chan openAnswer) <- a:
+	default: // already answered
+	}
+	return true
+}
+
+// writeOpenAnswer writes the HTTP answer of an open request: 200 with the
+// session, or the status of the core's refusal code with the code as body.
+func writeOpenAnswer(w http.ResponseWriter, a openAnswer) {
+	if !a.opened {
+		http.Error(w, a.errorCode, openRejectedStatus(a.errorCode))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		SessionID string `json:"session_id"`
+		Created   bool   `json:"created"`
+	}{a.sessionID, a.created})
+}
+
+// openRejectedStatus maps the core's refusal codes to HTTP statuses: the
+// caller's mistakes are 4xx and never worth a retry, everything else is the
+// core failing (internal_error, enrichment_failed) and worth one.
+func openRejectedStatus(code string) int {
+	switch code {
+	case "bad_request":
+		return http.StatusBadRequest
+	case "token_required", "auth_failed":
+		return http.StatusUnauthorized
+	case "forbidden":
+		return http.StatusForbidden
+	case "not_found":
+		return http.StatusNotFound
+	}
+	return http.StatusBadGateway
+}
+
 // handleUpgrade upgrades an HTTP request to a WebSocket connection.
 // The client can pass ?conversation_id=<id> to resume a previous session
 // (reconnect). Without it, a new conversation ID is generated.
@@ -482,7 +752,7 @@ func (c *Channel) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// connection has to be grouped by user (so a user's tabs share a fan-out
 	// set), and a token that cannot be resolved must never get a live socket.
 	// Fail closed — an unresolvable token is a plain 401, no upgrade.
-	entityID, err := c.resolver.resolve(r.Context(), token)
+	entityID, _, err := c.resolver.resolve(r.Context(), token)
 	if err != nil {
 		slog.Warn("websocket channel: identity resolution failed", "error", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -739,9 +1009,9 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 // cross-user delivery: the fan-out in Send is keyed by the raw conversation id
 // and relies on every set being single-owner (pinned at upgrade), so inject
 // must honour that same invariant rather than trusting the caller's id. The
-// cross-pod subscribe loop (subscribeLoop) is a second caller: it gates the
-// DELIVERY of a published frame on the same owner, dropping envelopes whose
-// owner does not match the local set's.
+// DELIVERY of a frame is gated on the same owner by recipients, not here: a
+// check here and a later snapshot of the sockets would each see another state
+// of the registry.
 func (c *Channel) conversationOwner(convID string) (string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
@@ -752,19 +1022,35 @@ func (c *Channel) conversationOwner(convID string) (string, bool) {
 	return set.ownerEntityID, true
 }
 
-// targets returns a snapshot of the live sockets for convID. The caller writes
-// outside the registry lock so one slow client can't stall other deliveries.
-func (c *Channel) targets(convID string) []*wsConn {
+// recipients returns a snapshot of the live sockets for convID that a frame of
+// owner may reach, and the set's owner: every socket of the set when owner is
+// empty (the core did not resolve one) or the set's owner, none and false on a
+// mismatch. The owner check and the snapshot share one hold of the registry
+// lock: taken apart, a socket set of another user registered between the two —
+// after the last socket of the owner left, or where none was — would receive
+// the frame. The caller writes outside the lock so one slow client can't stall
+// other deliveries.
+func (c *Channel) recipients(convID, owner string) ([]*wsConn, string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
 	set, ok := c.conns[convID]
 	if !ok {
-		return nil
+		return nil, "", true
+	}
+	if owner != "" && set.ownerEntityID != owner {
+		return nil, set.ownerEntityID, false
 	}
 	out := make([]*wsConn, 0, len(set.conns))
 	for cn := range set.conns {
 		out = append(out, cn)
 	}
+	return out, set.ownerEntityID, true
+}
+
+// targets returns a snapshot of every live socket for convID, for a frame that
+// comes from one of them (broadcastUserInput) and so has the set's owner.
+func (c *Channel) targets(convID string) []*wsConn {
+	out, _, _ := c.recipients(convID, "")
 	return out
 }
 
@@ -853,14 +1139,16 @@ func newWhoamiResolver(url, secret string) (*whoamiResolver, error) {
 	}, nil
 }
 
-// resolve returns the owning user id for token. Fail-closed: any transport,
-// non-2xx, decode, or empty-id outcome yields an error and the caller refuses
-// the socket. Mirrors the core verifier's contract (X-User-ID + X-Channel-Type
-// + X-Security-Token; entity_id read from the JSON body).
-func (r *whoamiResolver) resolve(ctx context.Context, token string) (string, error) {
+// resolve returns the owning user id for token and the token's interaction
+// kind ("system" for a backend's system token; empty or "chat" otherwise).
+// Fail-closed: any transport, non-2xx, decode, or empty-id outcome yields an
+// error and the caller refuses the socket. Mirrors the core verifier's
+// contract (X-User-ID + X-Channel-Type + X-Security-Token; entity_id and kind
+// read from the JSON body).
+func (r *whoamiResolver) resolve(ctx context.Context, token string) (entityID, kind string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
 	if err != nil {
-		return "", fmt.Errorf("whoami: build request: %w", err)
+		return "", "", fmt.Errorf("whoami: build request: %w", err)
 	}
 	req.Header.Set("X-User-ID", token)
 	req.Header.Set("X-Channel-Type", ID)
@@ -869,24 +1157,25 @@ func (r *whoamiResolver) resolve(ctx context.Context, token string) (string, err
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("whoami: request: %w", err)
+		return "", "", fmt.Errorf("whoami: request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("whoami: status %d", resp.StatusCode)
+		return "", "", fmt.Errorf("whoami: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		return "", fmt.Errorf("whoami: read body: %w", err)
+		return "", "", fmt.Errorf("whoami: read body: %w", err)
 	}
 	var payload struct {
 		EntityID string `json:"entity_id"`
+		Kind     string `json:"kind"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", fmt.Errorf("whoami: decode body: %w", err)
+		return "", "", fmt.Errorf("whoami: decode body: %w", err)
 	}
 	if payload.EntityID == "" {
-		return "", errors.New("whoami: response missing entity_id")
+		return "", "", errors.New("whoami: response missing entity_id")
 	}
-	return payload.EntityID, nil
+	return payload.EntityID, payload.Kind, nil
 }

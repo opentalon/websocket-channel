@@ -7,9 +7,14 @@
 // delivers it. Disabled = single-pod local delivery, exactly as before.
 //
 // Wire shape: one fanoutEnvelope JSON object per frame —
-// {origin, owner, conversation_id, frame} — where frame carries the
-// already-filtered client bytes (buildFrame output) verbatim, so a remote pod
-// writes byte-identical frames with no internal-metadata leak.
+// {origin, owner, conversation_id, open_request_id, frame} — where frame
+// carries the already-filtered client bytes (buildFrame output) verbatim, so a
+// remote pod writes byte-identical frames with no internal-metadata leak.
+//
+// Open answers: the core's answer to an open request (POST {path}/open) is
+// published with its open_request_id when the request does not wait on the
+// publishing pod. The pod it waits on hands it to the request; no pod ever
+// writes it to a socket.
 //
 // Owner gate: a subscriber only delivers an envelope whose owner matches the
 // local socket set's pinned owner; on mismatch it drops the frame, restoring
@@ -43,11 +48,13 @@ const fanoutChannel = "opentalon:ws:fanout"
 // writes the exact same bytes a local Send would — no profile_token or internal
 // (_-prefixed) metadata can leak to the browser through this path. Owner is the
 // resolved owner entity; a subscriber drops the frame on owner mismatch so the
-// single-owner boundary holds cross-pod.
+// single-owner boundary holds cross-pod. OpenRequestID is set on the core's
+// answer to an open request only (see openRequestID).
 type fanoutEnvelope struct {
 	Origin         string          `json:"origin"`
 	Owner          string          `json:"owner"`
 	ConversationID string          `json:"conversation_id"`
+	OpenRequestID  string          `json:"open_request_id,omitempty"`
 	Frame          json.RawMessage `json:"frame"`
 }
 
@@ -101,22 +108,29 @@ func (c *Channel) subscribeLoop() {
 		if env.Origin == c.origin {
 			continue
 		}
+		// An answer to an open request goes to the request if it waits here,
+		// and never to a socket. Resolved before the owner gate, which looks
+		// for a socket of the conversation and would drop it.
+		if env.OpenRequestID != "" {
+			var f outboundFrame
+			if err := json.Unmarshal(env.Frame, &f); err != nil {
+				slog.Warn("websocket fan-out: bad open answer", "error", err)
+				continue
+			}
+			c.answerOpen(env.OpenRequestID, openAnswerOf(f.Metadata))
+			continue
+		}
 		// Only deliver if a live socket set for this conversation exists on this
 		// pod AND its owner matches the envelope's owner. On mismatch, drop: that
 		// restores the single-owner boundary across pods (the same invariant the
 		// local fan-out relies on). An empty owner means the core did not resolve
-		// one (anonymous session), so it is not gated.
-		owner, ok := c.conversationOwner(env.ConversationID)
-		if !ok {
-			continue
-		}
-		if env.Owner != "" && owner != env.Owner {
+		// one (anonymous session), so it is not gated. deliverLocal checks the
+		// owner and picks the sockets in one step (see recipients).
+		if owner, ok := c.deliverLocal(context.Background(), env.ConversationID, env.Owner, env.Frame); !ok {
 			slog.Warn("websocket fan-out: owner mismatch, dropping",
 				"conversation_id", env.ConversationID, "origin", env.Origin,
 				"want_owner", owner, "got_owner", env.Owner)
-			continue
 		}
-		c.deliverLocal(context.Background(), env.ConversationID, env.Frame)
 	}
 }
 
@@ -133,6 +147,7 @@ func (c *Channel) publish(msg pkg.OutboundMessage, frame []byte) {
 		Origin:         c.origin,
 		Owner:          msg.Metadata[pkg.OwnerEntityMetadataKey],
 		ConversationID: msg.ConversationID,
+		OpenRequestID:  openRequestID(msg.Metadata),
 		Frame:          json.RawMessage(frame),
 	}
 	payload, err := json.Marshal(env)
