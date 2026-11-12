@@ -1,11 +1,14 @@
 package wschannel
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1913,6 +1916,51 @@ func TestHandleOpen_waitIncludesTheIdentityLookup(t *testing.T) {
 				if tc.reachesCore {
 					t.Error("the request never reached the core")
 				}
+			}
+		})
+	}
+}
+
+// A caller that stalls in its body holds no handler past the wait: the body's
+// reads share the request's deadline, and the caller gets 504. That holds for
+// a body cut off inside the JSON and for one cut off after a complete object.
+func TestHandleOpen_stalledBodyEndsWithTheWait(t *testing.T) {
+	const wait = 300 * time.Millisecond
+	for name, part := range map[string]string{
+		"inside the object": `{"token":"sys-u1",`,
+		"after the object":  `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ch, inbox, srv, cleanup := testServerWithUsers(t, nil)
+			defer cleanup()
+			ch.openWait = wait
+
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+			start := time.Now()
+			if _, err := fmt.Fprintf(conn, "POST /ws/open HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"+
+				"Content-Length: %d\r\n\r\n%s", len(part)+100, part); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(wait + 2*time.Second))
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("no answer to a stalled body: %v", err)
+			}
+			_ = resp.Body.Close()
+			if elapsed := time.Since(start); elapsed > wait+250*time.Millisecond {
+				t.Errorf("answered after %v, want within the wait of %v", elapsed, wait)
+			}
+			if resp.StatusCode != http.StatusGatewayTimeout {
+				t.Errorf("status = %d, want 504", resp.StatusCode)
+			}
+			select {
+			case msg := <-inbox:
+				t.Errorf("a request without its whole body reached the core: %+v", msg)
+			default:
 			}
 		})
 	}

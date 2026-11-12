@@ -553,7 +553,25 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 		Visibility      string `json:"visibility"`
 		ReasoningEffort string `json:"reasoning_effort"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body); err != nil {
+	// The context does not reach the body's reads, so a caller stalling in its
+	// body would hold the handler past the deadline: the connection's read
+	// deadline bounds them. The whole body is read under it, so the server
+	// never waits for an unread rest when it answers. Once the body is read
+	// the deadline is lifted, or it would also end the server's own read that
+	// notices the caller going away, and with it the request's context.
+	rc := http.NewResponseController(w)
+	deadline, _ := ctx.Deadline()
+	_ = rc.SetReadDeadline(deadline)
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		http.Error(w, "no request body within the wait", http.StatusGatewayTimeout)
+		return
+	}
+	if err == nil {
+		_ = rc.SetReadDeadline(time.Time{})
+		err = json.Unmarshal(raw, &body)
+	}
+	if err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
