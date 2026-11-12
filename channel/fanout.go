@@ -124,18 +124,13 @@ func (c *Channel) subscribeLoop() {
 		// pod AND its owner matches the envelope's owner. On mismatch, drop: that
 		// restores the single-owner boundary across pods (the same invariant the
 		// local fan-out relies on). An empty owner means the core did not resolve
-		// one (anonymous session), so it is not gated.
-		owner, ok := c.conversationOwner(env.ConversationID)
-		if !ok {
-			continue
-		}
-		if env.Owner != "" && owner != env.Owner {
+		// one (anonymous session), so it is not gated. deliverLocal checks the
+		// owner and picks the sockets in one step (see recipients).
+		if owner, ok := c.deliverLocal(context.Background(), env.ConversationID, env.Owner, env.Frame); !ok {
 			slog.Warn("websocket fan-out: owner mismatch, dropping",
 				"conversation_id", env.ConversationID, "origin", env.Origin,
 				"want_owner", owner, "got_owner", env.Owner)
-			continue
 		}
-		c.deliverLocal(context.Background(), env.ConversationID, env.Frame)
 	}
 }
 

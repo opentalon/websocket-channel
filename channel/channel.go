@@ -310,11 +310,9 @@ func (c *Channel) Send(ctx context.Context, msg pkg.OutboundMessage) error {
 		return nil
 	}
 	owner := msg.Metadata[pkg.OwnerEntityMetadataKey]
-	if local, ok := c.conversationOwner(msg.ConversationID); ok && owner != "" && local != owner {
+	if local, ok := c.deliverLocal(ctx, msg.ConversationID, owner, frame); !ok {
 		slog.Warn("websocket channel: owner mismatch, not delivering locally",
 			"conversation_id", msg.ConversationID, "want_owner", local, "got_owner", owner)
-	} else {
-		c.deliverLocal(ctx, msg.ConversationID, frame)
 	}
 	c.publish(msg, frame)
 	return nil
@@ -347,17 +345,22 @@ func (c *Channel) buildFrame(msg pkg.OutboundMessage) ([]byte, error) {
 	return json.Marshal(frame)
 }
 
-// deliverLocal fans the already-built frame out to every live socket this pod
-// holds for convID. A no-op when the conversation has no local socket (its
-// sockets may live on another pod, which delivers via the fan-out subscription).
+// deliverLocal fans the already-built frame of owner out to every live socket
+// this pod holds for convID. A no-op when the conversation has no local socket
+// (its sockets may live on another pod, which delivers via the fan-out
+// subscription). When owner is set and the local set belongs to another user it
+// writes nothing and returns that user and false (see recipients).
 // Writes are sequential because each socket requires serialized writes, but each
 // is bounded by writeTimeout so one stuck socket delays the rest by at most that
 // bound rather than blocking indefinitely; writes to distinct sockets never
 // contend (separate wsConn.mu). A failed or timed-out write is logged but never
 // aborts delivery to the others — that socket's readLoop observes the same break
 // and unregisters it via its defer, so removal stays single-sourced.
-func (c *Channel) deliverLocal(ctx context.Context, convID string, frame []byte) {
-	targets := c.targets(convID)
+func (c *Channel) deliverLocal(ctx context.Context, convID, owner string, frame []byte) (string, bool) {
+	targets, local, ok := c.recipients(convID, owner)
+	if !ok {
+		return local, false
+	}
 	slog.Debug("websocket deliverLocal", "conv", convID, "sockets", len(targets))
 	for _, cn := range targets {
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
@@ -369,6 +372,7 @@ func (c *Channel) deliverLocal(ctx context.Context, convID string, frame []byte)
 			slog.Debug("websocket deliverLocal: write failed", "conv", convID, "error", werr)
 		}
 	}
+	return local, true
 }
 
 // SendAndCapture implements pkg.UpdatableChannel. Returns an error so
@@ -971,10 +975,10 @@ func (c *Channel) removeConn(convID string, cn *wsConn) {
 // socket set currently exists for it. Used by the inject handler to refuse a
 // cross-user delivery: the fan-out in Send is keyed by the raw conversation id
 // and relies on every set being single-owner (pinned at upgrade), so inject
-// must honour that same invariant rather than trusting the caller's id. Send
-// and the cross-pod subscribe loop (subscribeLoop) are the other callers: they
-// gate the DELIVERY of a frame on the same owner, dropping frames whose owner
-// does not match the local set's.
+// must honour that same invariant rather than trusting the caller's id. The
+// DELIVERY of a frame is gated on the same owner by recipients, not here: a
+// check here and a later snapshot of the sockets would each see another state
+// of the registry.
 func (c *Channel) conversationOwner(convID string) (string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
@@ -985,19 +989,35 @@ func (c *Channel) conversationOwner(convID string) (string, bool) {
 	return set.ownerEntityID, true
 }
 
-// targets returns a snapshot of the live sockets for convID. The caller writes
-// outside the registry lock so one slow client can't stall other deliveries.
-func (c *Channel) targets(convID string) []*wsConn {
+// recipients returns a snapshot of the live sockets for convID that a frame of
+// owner may reach, and the set's owner: every socket of the set when owner is
+// empty (the core did not resolve one) or the set's owner, none and false on a
+// mismatch. The owner check and the snapshot share one hold of the registry
+// lock: taken apart, a socket set of another user registered between the two —
+// after the last socket of the owner left, or where none was — would receive
+// the frame. The caller writes outside the lock so one slow client can't stall
+// other deliveries.
+func (c *Channel) recipients(convID, owner string) ([]*wsConn, string, bool) {
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
 	set, ok := c.conns[convID]
 	if !ok {
-		return nil
+		return nil, "", true
+	}
+	if owner != "" && set.ownerEntityID != owner {
+		return nil, set.ownerEntityID, false
 	}
 	out := make([]*wsConn, 0, len(set.conns))
 	for cn := range set.conns {
 		out = append(out, cn)
 	}
+	return out, set.ownerEntityID, true
+}
+
+// targets returns a snapshot of every live socket for convID, for a frame that
+// comes from one of them (broadcastUserInput) and so has the set's owner.
+func (c *Channel) targets(convID string) []*wsConn {
+	out, _, _ := c.recipients(convID, "")
 	return out
 }
 

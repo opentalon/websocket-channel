@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1956,6 +1958,82 @@ func TestHandleOpen_replyNeverReachesAnotherUsersSocket(t *testing.T) {
 	}
 	if f := readContent(t, ctx, other); f.Content != "own" {
 		t.Errorf("the other user's socket received %+v, want only its own frame", f)
+	}
+}
+
+// The owner check and the choice of sockets see one state of the registry:
+// taken apart, a socket set of another user registered between the two would
+// receive the frame. Conversation c passes back and forth between a socket of
+// u1 and one of u2 while frames owned by u1 are delivered, through Send and
+// through the fan-out subscriber; none may reach u2's socket.
+func TestDelivery_ownerCheckedWithTheSocketChoice(t *testing.T) {
+	// Every refused frame logs a warning; keep thousands of them out of the output.
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, path := range []string{"send", "fan-out"} {
+		t.Run(path, func(t *testing.T) {
+			bus := newMemFanout()
+			ch, _, srv, cleanup := testServerWithFanout(t, map[string]string{"tabOwn": "u1", "tabOther": "u2"}, bus)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			own, _ := dialConvID(t, ctx, srv, "tabOwn", "own")
+			defer func() { _ = own.CloseNow() }()
+			other, _ := dialConvID(t, ctx, srv, "tabOther", "c")
+			defer func() { _ = other.CloseNow() }()
+			ownConn, otherConn := ch.targets("own"), ch.targets("c")
+			if len(ownConn) != 1 || len(otherConn) != 1 {
+				t.Fatalf("sockets = %d and %d, want one each", len(ownConn), len(otherConn))
+			}
+
+			go func() { // u1's socket may receive the frames; keep its writes flowing
+				for {
+					if _, _, err := own.Read(ctx); err != nil {
+						return
+					}
+				}
+			}()
+			leaked := make(chan []byte, 1)
+			go func() {
+				if _, raw, err := other.Read(ctx); err == nil {
+					leaked <- raw
+				}
+			}()
+			stop, toggled := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(toggled)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					ch.removeConn("c", otherConn[0])
+					_ = ch.addConn("c", "u1", ownConn[0])
+					ch.removeConn("c", ownConn[0])
+					_ = ch.addConn("c", "u2", otherConn[0])
+				}
+			}()
+			for end := time.Now().Add(500 * time.Millisecond); time.Now().Before(end) && len(leaked) == 0; {
+				if path == "send" {
+					_ = ch.Send(ctx, pkg.OutboundMessage{ConversationID: "c", Content: "u1's",
+						Metadata: map[string]string{"_owner_entity": "u1"}})
+				} else {
+					publishEnvelope(t, bus, "other-pod", "u1", "c", "u1's")
+				}
+			}
+			close(stop)
+			<-toggled
+
+			select {
+			case raw := <-leaked:
+				t.Fatalf("a socket of another user received %s", raw)
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
 	}
 }
 
