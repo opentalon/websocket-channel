@@ -1,11 +1,17 @@
 package wschannel
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -169,6 +175,8 @@ func TestNewID_unique(t *testing.T) {
 // header to an entity_id via mapping; a token absent from the map resolves to
 // the token string itself, so single-token tests get a stable user without
 // ceremony. An entity_id that resolves to "" yields HTTP 404 (token rejected).
+// A token with the prefix "sys" is a backend's system token (kind "system");
+// every other token is a chat token.
 func fakeWhoami(t *testing.T, mapping map[string]string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -181,9 +189,14 @@ func fakeWhoami(t *testing.T, mapping map[string]string) *httptest.Server {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		kind := "chat"
+		if strings.HasPrefix(token, "sys") {
+			kind = "system"
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"entity_id": entityID,
 			"group":     "g-" + entityID,
+			"kind":      kind,
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -216,6 +229,7 @@ func testServerWithUsers(t *testing.T, mapping map[string]string) (*Channel, <-c
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ch.handleUpgrade)
 	mux.HandleFunc("/ws/inject", ch.handleInject)
+	mux.HandleFunc("/ws/open", ch.handleOpen)
 	srv := httptest.NewServer(mux)
 
 	return ch, inbox, srv, func() {
@@ -1151,23 +1165,23 @@ func TestNewWhoamiResolver_requiresURL(t *testing.T) {
 func TestWhoamiResolver_resolve(t *testing.T) {
 	ctx := context.Background()
 
-	// Success: returns entity_id AND sends the exact /whoami contract headers.
+	// Success: returns entity_id and kind AND sends the exact /whoami contract headers.
 	t.Run("success_sends_contract_headers", func(t *testing.T) {
 		var gotUser, gotChan, gotSecret string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotUser = r.Header.Get("X-User-ID")
 			gotChan = r.Header.Get("X-Channel-Type")
 			gotSecret = r.Header.Get("X-Security-Token")
-			_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "user-42", "group": "g1"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "user-42", "group": "g1", "kind": "system"})
 		}))
 		defer srv.Close()
 		r, err := newWhoamiResolver(srv.URL, "sek")
 		if err != nil {
 			t.Fatalf("newWhoamiResolver: %v", err)
 		}
-		id, err := r.resolve(ctx, "tok-abc")
-		if err != nil || id != "user-42" {
-			t.Fatalf("resolve = %q, %v; want \"user-42\", nil", id, err)
+		id, kind, err := r.resolve(ctx, "tok-abc")
+		if err != nil || id != "user-42" || kind != "system" {
+			t.Fatalf("resolve = %q, %q, %v; want \"user-42\", \"system\", nil", id, kind, err)
 		}
 		if gotUser != "tok-abc" || gotChan != ID || gotSecret != "sek" {
 			t.Errorf("headers wrong: X-User-ID=%q X-Channel-Type=%q X-Security-Token=%q", gotUser, gotChan, gotSecret)
@@ -1189,7 +1203,7 @@ func TestWhoamiResolver_resolve(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
 			r, _ := newWhoamiResolver(srv.URL, "sek")
-			if id, err := r.resolve(ctx, "tok"); err == nil {
+			if id, _, err := r.resolve(ctx, "tok"); err == nil {
 				t.Errorf("%s: expected error, got id=%q nil", tc.name, id)
 			}
 		})
@@ -1205,7 +1219,7 @@ func TestWhoamiResolver_resolve(t *testing.T) {
 		}))
 		defer srv.Close()
 		r, _ := newWhoamiResolver(srv.URL, "") // empty config secret → env fallback
-		if _, err := r.resolve(ctx, "tok"); err != nil {
+		if _, _, err := r.resolve(ctx, "tok"); err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
 		if gotSecret != "from-env" {
@@ -1600,5 +1614,594 @@ func TestReadLoop_spokenMessageAsksForASpokenReply(t *testing.T) {
 		if _, ok := msg.Metadata["spoken"]; ok {
 			t.Errorf("hint %v: a client hint other than reply reached core: %v", tc.hint, msg.Metadata)
 		}
+	}
+}
+
+// ── server-side open ──────────────────────────────────────────────────────────
+
+// openResult is the HTTP answer of one POST /ws/open; err is a transport or
+// decode failure.
+type openResult struct {
+	status    int
+	sessionID string
+	created   bool
+	err       string
+}
+
+// postOpen posts body to /ws/open in the background and delivers the answer on
+// the returned channel, so the test can play the core while the request waits.
+func postOpen(t *testing.T, srv *httptest.Server, body string) <-chan openResult {
+	t.Helper()
+	out := make(chan openResult, 1)
+	go func() {
+		resp, err := http.Post(srv.URL+"/ws/open", "application/json", strings.NewReader(body))
+		if err != nil {
+			out <- openResult{err: err.Error()}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		res := openResult{status: resp.StatusCode}
+		if resp.StatusCode == http.StatusOK {
+			var b struct {
+				SessionID string `json:"session_id"`
+				Created   bool   `json:"created"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+				res.err = err.Error()
+			}
+			res.sessionID, res.created = b.SessionID, b.Created
+		}
+		out <- res
+	}()
+	return out
+}
+
+func awaitOpen(t *testing.T, res <-chan openResult) openResult {
+	t.Helper()
+	select {
+	case r := <-res:
+		return r
+	case <-time.After(3 * time.Second):
+		t.Fatal("open request never answered")
+		return openResult{}
+	}
+}
+
+// sessionOpened is the core's acknowledgement of the open request msg,
+// addressed to convID.
+func sessionOpened(msg pkg.InboundMessage, convID, sessionID string, created bool) pkg.OutboundMessage {
+	return pkg.OutboundMessage{
+		ConversationID: convID,
+		Metadata: map[string]string{
+			"type":            "session_opened",
+			"session_id":      sessionID,
+			"created":         strconv.FormatBool(created),
+			"open_request_id": msg.Metadata["open_request_id"],
+			"_owner_entity":   "u1",
+		},
+	}
+}
+
+func TestHandleOpen_answersOnceTheCoreCommitted(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var firstSession string
+	for _, tc := range []struct {
+		name    string
+		body    string
+		want    map[string]string // metadata the core receives
+		absent  []string
+		created bool
+	}{
+		{
+			name: "open",
+			body: `{"token":"sys-u1","opened_by":"setup","open_key":"k1","content":"facts","visibility":"hidden","reasoning_effort":"low"}`,
+			want: map[string]string{"profile_token": "sys-u1", "open_session": "true", "opened_by": "setup",
+				"open_key": "k1", "visibility": "hidden", "reasoning_effort": "low"},
+			absent:  []string{"session_id", "note_key"},
+			created: true,
+		},
+		{
+			name:   "same key again",
+			body:   `{"token":"sys-u1","opened_by":"setup","open_key":"k1","content":"facts"}`,
+			want:   map[string]string{"open_session": "true", "opened_by": "setup", "open_key": "k1"},
+			absent: []string{"session_id", "note_key"},
+		},
+		{
+			name:    "continuation",
+			body:    `{"token":"sys-u1","session_id":"u1:websocket:c0","note_key":"n1","content":"note"}`,
+			want:    map[string]string{"open_session": "true", "session_id": "u1:websocket:c0", "note_key": "n1"},
+			absent:  []string{"opened_by", "open_key"},
+			created: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := postOpen(t, srv, tc.body)
+			msg := recvInbox(t, ctx, inbox)
+			if msg.ChannelID != ID || len(msg.ConversationID) != 32 || msg.SenderID != msg.ConversationID {
+				t.Errorf("message ids = %q/%q/%q, want websocket and one minted conversation id",
+					msg.ChannelID, msg.ConversationID, msg.SenderID)
+			}
+			for k, v := range tc.want {
+				if msg.Metadata[k] != v {
+					t.Errorf("metadata[%q] = %q, want %q", k, msg.Metadata[k], v)
+				}
+			}
+			for _, k := range tc.absent {
+				if _, ok := msg.Metadata[k]; ok {
+					t.Errorf("metadata[%q] must be absent, got %q", k, msg.Metadata[k])
+				}
+			}
+			if msg.Metadata["open_request_id"] == "" {
+				t.Fatal("the request carries no open_request_id")
+			}
+
+			select {
+			case r := <-res:
+				t.Fatalf("answered %+v before the core's session_opened", r)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			session := "u1:websocket:" + msg.ConversationID
+			switch {
+			case tc.name == "continuation":
+				session = "u1:websocket:c0"
+			case !tc.created:
+				session = firstSession
+			default:
+				firstSession = session
+			}
+			if err := ch.Send(ctx, sessionOpened(msg, msg.ConversationID, session, tc.created)); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			want := openResult{status: http.StatusOK, sessionID: session, created: tc.created}
+			if got := awaitOpen(t, res); got != want {
+				t.Errorf("answer = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// Concurrent attempts with one key, and two origins with that key, each get
+// the answer the core gave them: the answer is keyed by the attempt, neither
+// by the key nor by the order of the answers.
+func TestHandleOpen_attemptsGetTheirOwnAnswer(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	want := map[string]openResult{
+		"a1": {status: http.StatusOK, sessionID: "u1:websocket:a", created: true},
+		"a2": {status: http.StatusOK, sessionID: "u1:websocket:a", created: false},
+		"b":  {status: http.StatusOK, sessionID: "u1:websocket:b", created: true},
+	}
+	results := map[string]<-chan openResult{
+		"a1": postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"a1"}`),
+		"a2": postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"a2"}`),
+		"b":  postOpen(t, srv, `{"token":"sys-u1","opened_by":"b","open_key":"k","content":"b"}`),
+	}
+	var msgs []pkg.InboundMessage
+	for range results {
+		msgs = append(msgs, recvInbox(t, ctx, inbox))
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		w := want[m.Content]
+		if err := ch.Send(ctx, sessionOpened(m, m.ConversationID, w.sessionID, w.created)); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	for name, res := range results {
+		if got := awaitOpen(t, res); got != want[name] {
+			t.Errorf("%s: answer = %+v, want %+v", name, got, want[name])
+		}
+	}
+}
+
+func TestHandleOpen_refusedBeforeTheCore(t *testing.T) {
+	_, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-bad": "", "sys-u1": "u1"})
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		body   string
+		want   int
+	}{
+		{"chat token", http.MethodPost, `{"token":"u1","opened_by":"a","open_key":"k","content":"x"}`, http.StatusForbidden},
+		{"unknown token", http.MethodPost, `{"token":"sys-bad","opened_by":"a","open_key":"k","content":"x"}`, http.StatusUnauthorized},
+		{"no token", http.MethodPost, `{"opened_by":"a","open_key":"k","content":"x"}`, http.StatusBadRequest},
+		{"no content", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k"}`, http.StatusBadRequest},
+		{"no origin", http.MethodPost, `{"token":"sys-u1","open_key":"k","content":"x"}`, http.StatusBadRequest},
+		{"no key", http.MethodPost, `{"token":"sys-u1","opened_by":"a","content":"x"}`, http.StatusBadRequest},
+		{"continuation without note key", http.MethodPost, `{"token":"sys-u1","session_id":"u1:websocket:c","content":"x"}`, http.StatusBadRequest},
+		{"malformed body", http.MethodPost, `{not json`, http.StatusBadRequest},
+		{"not a POST", http.MethodGet, ``, http.StatusMethodNotAllowed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, srv.URL+"/ws/open", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+			select {
+			case msg := <-inbox:
+				t.Errorf("a refused request must not reach the core, got %+v", msg)
+			default:
+			}
+		})
+	}
+}
+
+func TestHandleOpen_coreRefusalStatus(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for code, want := range map[string]int{
+		"not_found":      http.StatusNotFound,
+		"bad_request":    http.StatusBadRequest,
+		"forbidden":      http.StatusForbidden,
+		"auth_failed":    http.StatusUnauthorized,
+		"token_required": http.StatusUnauthorized,
+		"internal_error": http.StatusBadGateway,
+	} {
+		t.Run(code, func(t *testing.T) {
+			res := postOpen(t, srv, `{"token":"sys-u1","session_id":"u1:websocket:gone","note_key":"n","content":"note"}`)
+			msg := recvInbox(t, ctx, inbox)
+			if err := ch.Send(ctx, pkg.OutboundMessage{
+				ConversationID: msg.ConversationID,
+				Content:        "refused",
+				Metadata: map[string]string{
+					"type": "open_rejected", "error_code": code,
+					"open_request_id": msg.Metadata["open_request_id"],
+				},
+			}); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if got := awaitOpen(t, res); got.status != want {
+				t.Errorf("status = %d, want %d", got.status, want)
+			}
+		})
+	}
+}
+
+func TestHandleOpen_noAnswerWithinTheWaitIs504(t *testing.T) {
+	if got := New(Config{}).openWait; got != 10*time.Second {
+		t.Errorf("default wait = %v, want 10s", got)
+	}
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1"})
+	defer cleanup()
+	ch.openWait = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res := postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`)
+	recvInbox(t, ctx, inbox) // the core takes the request and never answers
+	if got := awaitOpen(t, res); got.status != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504", got.status)
+	}
+	ch.pending.Range(func(k, _ any) bool {
+		t.Errorf("request %v still waits after its answer", k)
+		return true
+	})
+}
+
+// The wait runs from the request's arrival: a slow identity lookup takes its
+// share of it, so the caller gets the 504 within the wait and not the lookup's
+// duration later. A lookup that outlasts the wait answers 504 too, not 401: the
+// token was never refused.
+func TestHandleOpen_waitIncludesTheIdentityLookup(t *testing.T) {
+	const wait = 500 * time.Millisecond
+	for _, tc := range []struct {
+		name        string
+		lookup      time.Duration
+		reachesCore bool
+	}{
+		{"lookup within the wait", 400 * time.Millisecond, true},
+		{"lookup beyond the wait", 2 * wait, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ch, inbox, srv, cleanup := testServerWithUsers(t, nil)
+			defer cleanup()
+			ch.openWait = wait
+			slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-time.After(tc.lookup):
+				case <-r.Context().Done():
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "u1", "kind": "system"})
+			}))
+			defer slow.Close()
+			resolver, err := newWhoamiResolver(slow.URL, "test-secret")
+			if err != nil {
+				t.Fatalf("newWhoamiResolver: %v", err)
+			}
+			ch.resolver = resolver
+
+			start := time.Now()
+			got := awaitOpen(t, postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`))
+			if elapsed := time.Since(start); elapsed > wait+250*time.Millisecond {
+				t.Errorf("answered after %v, want within the wait of %v", elapsed, wait)
+			}
+			if got.status != http.StatusGatewayTimeout {
+				t.Errorf("status = %d, want 504", got.status)
+			}
+			select {
+			case <-inbox:
+				if !tc.reachesCore {
+					t.Error("a request without an identity reached the core")
+				}
+			default:
+				if tc.reachesCore {
+					t.Error("the request never reached the core")
+				}
+			}
+		})
+	}
+}
+
+// A caller that stalls in its body holds no handler past the wait: the body's
+// reads share the request's deadline, and the caller gets 504. That holds for
+// a body cut off inside the JSON and for one cut off after a complete object,
+// and a request that is not a POST gets its 405 within the wait as well.
+func TestHandleOpen_stalledBodyEndsWithTheWait(t *testing.T) {
+	const wait = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name, method, part string
+		want               int
+	}{
+		{"inside the object", http.MethodPost, `{"token":"sys-u1",`, http.StatusGatewayTimeout},
+		{"after the object", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`,
+			http.StatusGatewayTimeout},
+		{"not a POST", http.MethodPut, `{`, http.StatusMethodNotAllowed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ch, inbox, srv, cleanup := testServerWithUsers(t, nil)
+			defer cleanup()
+			ch.openWait = wait
+
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+			start := time.Now()
+			if _, err := fmt.Fprintf(conn, "%s /ws/open HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"+
+				"Content-Length: %d\r\n\r\n%s", tc.method, len(tc.part)+100, tc.part); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(wait + 2*time.Second))
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("no answer to a stalled body: %v", err)
+			}
+			_ = resp.Body.Close()
+			if elapsed := time.Since(start); elapsed > wait+250*time.Millisecond {
+				t.Errorf("answered after %v, want within the wait of %v", elapsed, wait)
+			}
+			if resp.StatusCode != tc.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+			select {
+			case msg := <-inbox:
+				t.Errorf("a request without its whole body reached the core: %+v", msg)
+			default:
+			}
+		})
+	}
+}
+
+// The core's answer never reaches a socket, even when it names a conversation
+// that has one; the session's own frames after it reach only that
+// conversation's sockets.
+func TestHandleOpen_onlyTheTurnReachesTheSessionsSockets(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1", "tabX": "u1", "tabY": "u1"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	connX, _ := dialConvID(t, ctx, srv, "tabX", "convx")
+	defer func() { _ = connX.CloseNow() }()
+	connY, _ := dialConvID(t, ctx, srv, "tabY", "convy")
+	defer func() { _ = connY.CloseNow() }()
+
+	res := postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"facts"}`)
+	msg := recvInbox(t, ctx, inbox)
+	if err := ch.Send(ctx, sessionOpened(msg, "convx", "u1:websocket:convx", false)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	want := openResult{status: http.StatusOK, sessionID: "u1:websocket:convx"}
+	if got := awaitOpen(t, res); got != want {
+		t.Fatalf("answer = %+v, want %+v", got, want)
+	}
+	if err := ch.Send(ctx, pkg.OutboundMessage{ConversationID: "convx", Metadata: map[string]string{
+		"type": "open_rejected", "error_code": "not_found", "open_request_id": "answered-elsewhere",
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	sendTurnFrames(t, ctx, ch, "convx")
+	expectTurnFrames(t, ctx, connX)
+	shortCtx, shortCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer shortCancel()
+	if _, raw, err := connY.Read(shortCtx); err == nil {
+		t.Errorf("a socket of another conversation received %s", raw)
+	}
+}
+
+// Across two pods: the core's answer sent through the pod without the request
+// answers it on the pod that holds it, and the turn's frames sent through that
+// pod reach the session's socket on the other one.
+func TestHandleOpen_acrossPods(t *testing.T) {
+	bus := newMemFanout()
+	users := map[string]string{"sys-u1": "u1", "tabX": "u1"}
+	a, inboxA, srvA, cleanupA := testServerWithFanout(t, users, bus)
+	defer cleanupA()
+	b, _, srvB, cleanupB := testServerWithFanout(t, users, bus)
+	defer cleanupB()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	connX, _ := dialConvID(t, ctx, srvB, "tabX", "convx")
+	defer func() { _ = connX.CloseNow() }()
+
+	res := postOpen(t, srvA, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"facts"}`)
+	msg := recvInbox(t, ctx, inboxA)
+	if err := b.Send(ctx, sessionOpened(msg, "convx", "u1:websocket:convx", true)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	want := openResult{status: http.StatusOK, sessionID: "u1:websocket:convx", created: true}
+	if got := awaitOpen(t, res); got != want {
+		t.Fatalf("answer = %+v, want %+v", got, want)
+	}
+
+	sendTurnFrames(t, ctx, a, "convx")
+	expectTurnFrames(t, ctx, connX)
+}
+
+// A continuation of one user's session never delivers into a socket set of
+// another user that holds the same conversation id on this pod.
+func TestHandleOpen_replyNeverReachesAnotherUsersSocket(t *testing.T) {
+	ch, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"sys-u1": "u1", "tabOther": "u2"})
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	other, _ := dialConvID(t, ctx, srv, "tabOther", "c")
+	defer func() { _ = other.CloseNow() }()
+
+	res := postOpen(t, srv, `{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n1","content":"note"}`)
+	msg := recvInbox(t, ctx, inbox)
+	if err := ch.Send(ctx, sessionOpened(msg, msg.ConversationID, "u1:websocket:c", true)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := awaitOpen(t, res); got.status != http.StatusOK {
+		t.Fatalf("answer = %+v, want 200", got)
+	}
+
+	sendTurnFrames(t, ctx, ch, "c")
+	if err := ch.Send(ctx, pkg.OutboundMessage{ConversationID: "c", Content: "own",
+		Metadata: map[string]string{"_owner_entity": "u2"}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if f := readContent(t, ctx, other); f.Content != "own" {
+		t.Errorf("the other user's socket received %+v, want only its own frame", f)
+	}
+}
+
+// The owner check and the choice of sockets see one state of the registry:
+// taken apart, a socket set of another user registered between the two would
+// receive the frame. Conversation c passes back and forth between a socket of
+// u1 and one of u2 while frames owned by u1 are delivered, through Send and
+// through the fan-out subscriber; none may reach u2's socket.
+func TestDelivery_ownerCheckedWithTheSocketChoice(t *testing.T) {
+	// Every refused frame logs a warning; keep thousands of them out of the output.
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, path := range []string{"send", "fan-out"} {
+		t.Run(path, func(t *testing.T) {
+			bus := newMemFanout()
+			ch, _, srv, cleanup := testServerWithFanout(t, map[string]string{"tabOwn": "u1", "tabOther": "u2"}, bus)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			own, _ := dialConvID(t, ctx, srv, "tabOwn", "own")
+			defer func() { _ = own.CloseNow() }()
+			other, _ := dialConvID(t, ctx, srv, "tabOther", "c")
+			defer func() { _ = other.CloseNow() }()
+			ownConn, otherConn := ch.targets("own"), ch.targets("c")
+			if len(ownConn) != 1 || len(otherConn) != 1 {
+				t.Fatalf("sockets = %d and %d, want one each", len(ownConn), len(otherConn))
+			}
+
+			go func() { // u1's socket may receive the frames; keep its writes flowing
+				for {
+					if _, _, err := own.Read(ctx); err != nil {
+						return
+					}
+				}
+			}()
+			leaked := make(chan []byte, 1)
+			go func() {
+				if _, raw, err := other.Read(ctx); err == nil {
+					leaked <- raw
+				}
+			}()
+			stop, toggled := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(toggled)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					ch.removeConn("c", otherConn[0])
+					_ = ch.addConn("c", "u1", ownConn[0])
+					ch.removeConn("c", ownConn[0])
+					_ = ch.addConn("c", "u2", otherConn[0])
+				}
+			}()
+			for end := time.Now().Add(500 * time.Millisecond); time.Now().Before(end) && len(leaked) == 0; {
+				if path == "send" {
+					_ = ch.Send(ctx, pkg.OutboundMessage{ConversationID: "c", Content: "u1's",
+						Metadata: map[string]string{"_owner_entity": "u1"}})
+				} else {
+					publishEnvelope(t, bus, "other-pod", "u1", "c", "u1's")
+				}
+			}
+			close(stop)
+			<-toggled
+
+			select {
+			case raw := <-leaked:
+				t.Fatalf("a socket of another user received %s", raw)
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// sendTurnFrames sends what the core sends after its answer: the opener's
+// reply and a model error, both addressed to the session's conversation and
+// carrying no open_request_id.
+func sendTurnFrames(t *testing.T, ctx context.Context, ch *Channel, convID string) {
+	t.Helper()
+	for _, m := range []pkg.OutboundMessage{
+		{ConversationID: convID, Content: "hello", Metadata: map[string]string{"_owner_entity": "u1", "opened_by": "a"}},
+		{ConversationID: convID, Content: "oops", Metadata: map[string]string{"_owner_entity": "u1", "type": "error", "error_code": "internal_error"}},
+	} {
+		if err := ch.Send(ctx, m); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+}
+
+// expectTurnFrames reads the reply and the error frame sendTurnFrames sent, and
+// nothing before them.
+func expectTurnFrames(t *testing.T, ctx context.Context, conn *websocket.Conn) {
+	t.Helper()
+	if f := readContent(t, ctx, conn); f.Content != "hello" || f.Metadata["type"] != "" {
+		t.Errorf("first frame = %+v, want the reply", f)
+	}
+	if f := readContent(t, ctx, conn); f.Content != "oops" || f.Metadata["type"] != "error" {
+		t.Errorf("second frame = %+v, want the error frame", f)
 	}
 }

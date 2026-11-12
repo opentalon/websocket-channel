@@ -93,7 +93,7 @@ Connections without a token are rejected with HTTP 401.
 `content` is HTML. Each WebSocket connection gets a unique `conversation_id`.
 
 Clients cannot set message visibility — hiding a turn from the audited
-transcript is reserved for the server-to-server inject endpoint below.
+transcript is reserved for the server-to-server endpoints below.
 
 **Server-to-server inject** (`POST {path}/inject`)
 
@@ -121,6 +121,49 @@ fans out to the user's live browser sockets for the conversation. `visibility:
 "hidden"` marks the injected turn as model-only — fed to the model but dropped
 from the user-facing transcript (honored only for a WhoAmI-verified system
 profile).
+
+**Server-to-server open** (`POST {path}/open`)
+
+A trusted backend opens a chat session for a user, seeded with hidden content
+the assistant answers, so the assistant can start the conversation. Only a
+system token (WhoAmI `kind: "system"`) may call it.
+
+```json
+{
+  "token": "<system profile_token>",
+  "opened_by": "<origin label>",
+  "open_key": "<idempotency key of the event>",
+  "content": "<hidden context for the first turn>",
+  "visibility": "hidden",
+  "reasoning_effort": "low"
+}
+```
+
+To continue such a session, send `session_id` (from an earlier answer) and
+`note_key` instead of `opened_by` and `open_key`: the content becomes a hidden
+note in that session, stored and answered once per note key. `visibility` and
+`reasoning_effort` are optional and passed to the core as on `/inject`; the
+content is hidden either way.
+
+Returns `200 {"session_id": "<user>:websocket:<conversation>", "created": true}`
+only after the core committed the session. `created` is `false` when the same
+user, origin and key found the existing session (its first turn never runs
+twice) or the note key was already stored.
+
+| Status | Meaning |
+|---|---|
+| `400` | bad body or missing field |
+| `401` | unresolvable token |
+| `403` | not a system token |
+| `404` | the session to continue does not exist or belongs to another user |
+| `405` | non-POST |
+| `502` | the core failed; retry with the same key |
+| `503` | the core did not take the request; retry with the same key |
+| `504` | no answer within 10 seconds of the request, identity lookup included; retry with the same key |
+
+The assistant's reply goes to the session's conversation like any reply: to
+the sockets that hold it, never to another conversation's or another user's. A
+client that attaches later reads it from the session's history.
 
 ## Demo
 
