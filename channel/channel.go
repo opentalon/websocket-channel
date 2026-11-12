@@ -142,7 +142,7 @@ type Channel struct {
 type inboundFrame struct {
 	Content  string         `json:"content"`
 	Files    []fileFrame    `json:"files,omitempty"`
-	Metadata map[string]any `json:"metadata,omitempty"` // client hints (e.g. prompt_type); used locally — only the confirmation decision is forwarded to core (see metadata["confirmation"])
+	Metadata map[string]any `json:"metadata,omitempty"` // client hints (e.g. prompt_type); used locally — only the confirmation decision and a spoken message's reply=spoken are forwarded to core
 }
 
 type fileFrame struct {
@@ -917,12 +917,17 @@ func (c *Channel) readLoop(ctx context.Context, cn *wsConn, convID, token string
 		// signal path ONLY for the canonical values approve/reject; any other
 		// value (or none) safely falls through to LLM classification of the reply
 		// text. The frontend buttons only ever send approve/reject, so a button
-		// press never depends on the y/n content being interpreted. Only this one
-		// key is forwarded; all other client hints stay local.
+		// press never depends on the y/n content being interpreted. Only this key
+		// and reply (below) are forwarded; all other client hints stay local.
 		if isControlReply(frame.Metadata) {
 			if action, _ := frame.Metadata["action"].(string); action != "" {
 				meta["confirmation"] = action
 			}
+		}
+		// A message the person spoke asks for the answer read aloud: core then
+		// has the model write a short spoken version too. Only this one value.
+		if reply, _ := frame.Metadata["reply"].(string); reply == "spoken" {
+			meta["reply"] = "spoken"
 		}
 		// Scope the turn to a workflow agent when the socket was opened with
 		// ?agent_id=… (Timly AI Workflows chat). Core grounds the turn on it.
