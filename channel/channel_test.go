@@ -1923,14 +1923,20 @@ func TestHandleOpen_waitIncludesTheIdentityLookup(t *testing.T) {
 
 // A caller that stalls in its body holds no handler past the wait: the body's
 // reads share the request's deadline, and the caller gets 504. That holds for
-// a body cut off inside the JSON and for one cut off after a complete object.
+// a body cut off inside the JSON and for one cut off after a complete object,
+// and a request that is not a POST gets its 405 within the wait as well.
 func TestHandleOpen_stalledBodyEndsWithTheWait(t *testing.T) {
 	const wait = 300 * time.Millisecond
-	for name, part := range map[string]string{
-		"inside the object": `{"token":"sys-u1",`,
-		"after the object":  `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`,
+	for _, tc := range []struct {
+		name, method, part string
+		want               int
+	}{
+		{"inside the object", http.MethodPost, `{"token":"sys-u1",`, http.StatusGatewayTimeout},
+		{"after the object", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`,
+			http.StatusGatewayTimeout},
+		{"not a POST", http.MethodPut, `{`, http.StatusMethodNotAllowed},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			ch, inbox, srv, cleanup := testServerWithUsers(t, nil)
 			defer cleanup()
 			ch.openWait = wait
@@ -1941,8 +1947,8 @@ func TestHandleOpen_stalledBodyEndsWithTheWait(t *testing.T) {
 			}
 			defer func() { _ = conn.Close() }()
 			start := time.Now()
-			if _, err := fmt.Fprintf(conn, "POST /ws/open HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"+
-				"Content-Length: %d\r\n\r\n%s", len(part)+100, part); err != nil {
+			if _, err := fmt.Fprintf(conn, "%s /ws/open HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"+
+				"Content-Length: %d\r\n\r\n%s", tc.method, len(tc.part)+100, tc.part); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 			_ = conn.SetReadDeadline(time.Now().Add(wait + 2*time.Second))
@@ -1954,8 +1960,8 @@ func TestHandleOpen_stalledBodyEndsWithTheWait(t *testing.T) {
 			if elapsed := time.Since(start); elapsed > wait+250*time.Millisecond {
 				t.Errorf("answered after %v, want within the wait of %v", elapsed, wait)
 			}
-			if resp.StatusCode != http.StatusGatewayTimeout {
-				t.Errorf("status = %d, want 504", resp.StatusCode)
+			if resp.StatusCode != tc.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
 			}
 			select {
 			case msg := <-inbox:

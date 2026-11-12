@@ -534,14 +534,25 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 // answer within openWait of the request's arrival the caller gets 504 and may
 // retry with the same key.
 func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	// One deadline for the whole request: a wait started after the identity
 	// lookup would answer up to the lookup's duration later than openWait.
 	ctx, cancel := context.WithTimeout(r.Context(), c.openWait)
 	defer cancel()
+	// The context does not reach the body's reads, so a caller stalling in its
+	// body would hold the handler past the deadline: the connection's read
+	// deadline bounds them, from the start, since the server reads an unread
+	// body to its end before it sends any answer, a refusal included. The
+	// whole body is read under it, so the server never waits for an unread
+	// rest after that. Once the body is read the deadline is lifted, or it
+	// would also end the server's own read that notices the caller going away,
+	// and with it the request's context.
+	rc := http.NewResponseController(w)
+	deadline, _ := ctx.Deadline()
+	_ = rc.SetReadDeadline(deadline)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
 	var body struct {
 		Token           string `json:"token"`
@@ -553,15 +564,6 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 		Visibility      string `json:"visibility"`
 		ReasoningEffort string `json:"reasoning_effort"`
 	}
-	// The context does not reach the body's reads, so a caller stalling in its
-	// body would hold the handler past the deadline: the connection's read
-	// deadline bounds them. The whole body is read under it, so the server
-	// never waits for an unread rest when it answers. Once the body is read
-	// the deadline is lifted, or it would also end the server's own read that
-	// notices the caller going away, and with it the request's context.
-	rc := http.NewResponseController(w)
-	deadline, _ := ctx.Deadline()
-	_ = rc.SetReadDeadline(deadline)
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		http.Error(w, "no request body within the wait", http.StatusGatewayTimeout)
