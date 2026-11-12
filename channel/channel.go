@@ -48,9 +48,10 @@ const (
 // only credential that may open a session for a user (POST {path}/open).
 const kindSystem = "system"
 
-// openAnswerWait bounds how long POST {path}/open waits for the core's answer,
-// the hand-off to the core included. A caller whose own timeout is longer
-// always receives the answer, or the 504, before it gives up.
+// openAnswerWait bounds POST {path}/open from the request's arrival: the
+// identity lookup, the hand-off to the core and the wait for its answer share
+// it. A caller whose own timeout is longer always receives the answer, or the
+// 503 or 504, before it gives up.
 const openAnswerWait = 10 * time.Second
 
 // writeTimeout bounds every externally-blocking step of message delivery:
@@ -530,12 +531,17 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 // which the core echoes on its answer and Send routes here. Neither the
 // conversation nor the key could key the wait: a found or continued session is
 // another conversation, and concurrent attempts may share a key. Without an
-// answer within openWait the caller gets 504 and may retry with the same key.
+// answer within openWait of the request's arrival the caller gets 504 and may
+// retry with the same key.
 func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// One deadline for the whole request: a wait started after the identity
+	// lookup would answer up to the lookup's duration later than openWait.
+	ctx, cancel := context.WithTimeout(r.Context(), c.openWait)
+	defer cancel()
 
 	var body struct {
 		Token           string `json:"token"`
@@ -562,8 +568,14 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, kind, err := c.resolver.resolve(r.Context(), body.Token)
+	_, kind, err := c.resolver.resolve(ctx, body.Token)
 	if err != nil {
+		// A lookup cut short by the deadline refused no token: the caller may
+		// retry, as on any other 504.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			http.Error(w, "no identity within the wait", http.StatusGatewayTimeout)
+			return
+		}
 		slog.Warn("websocket channel: open identity resolution failed", "error", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -607,22 +619,23 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 		Timestamp:      time.Now(),
 	}
 
-	wait := time.NewTimer(c.openWait)
-	defer wait.Stop()
+	// ctx ends with the deadline or when the caller goes away; only the
+	// deadline gets an answer.
 	select {
 	case c.inbox <- msg:
-	case <-r.Context().Done():
-		return
-	case <-wait.C:
-		http.Error(w, "channel busy", http.StatusServiceUnavailable)
+	case <-ctx.Done():
+		if r.Context().Err() == nil {
+			http.Error(w, "channel busy", http.StatusServiceUnavailable)
+		}
 		return
 	}
 	select {
 	case a := <-answer:
 		writeOpenAnswer(w, a)
-	case <-r.Context().Done():
-	case <-wait.C:
-		http.Error(w, "no answer from the core", http.StatusGatewayTimeout)
+	case <-ctx.Done():
+		if r.Context().Err() == nil {
+			http.Error(w, "no answer from the core", http.StatusGatewayTimeout)
+		}
 	}
 }
 

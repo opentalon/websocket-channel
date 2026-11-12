@@ -159,7 +159,7 @@ twice) or the note key was already stored.
 | `405` | non-POST |
 | `502` | the core failed; retry with the same key |
 | `503` | the core did not take the request; retry with the same key |
-| `504` | no answer within 10 seconds; retry with the same key |
+| `504` | no answer within 10 seconds of the request, identity lookup included; retry with the same key |
 
 The assistant's reply goes to the session's conversation like any reply: to
 the sockets that hold it, never to another conversation's or another user's. A

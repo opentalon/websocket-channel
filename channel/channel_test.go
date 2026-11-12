@@ -1863,6 +1863,61 @@ func TestHandleOpen_noAnswerWithinTheWaitIs504(t *testing.T) {
 	})
 }
 
+// The wait runs from the request's arrival: a slow identity lookup takes its
+// share of it, so the caller gets the 504 within the wait and not the lookup's
+// duration later. A lookup that outlasts the wait answers 504 too, not 401: the
+// token was never refused.
+func TestHandleOpen_waitIncludesTheIdentityLookup(t *testing.T) {
+	const wait = 500 * time.Millisecond
+	for _, tc := range []struct {
+		name        string
+		lookup      time.Duration
+		reachesCore bool
+	}{
+		{"lookup within the wait", 400 * time.Millisecond, true},
+		{"lookup beyond the wait", 2 * wait, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ch, inbox, srv, cleanup := testServerWithUsers(t, nil)
+			defer cleanup()
+			ch.openWait = wait
+			slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-time.After(tc.lookup):
+				case <-r.Context().Done():
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]string{"entity_id": "u1", "kind": "system"})
+			}))
+			defer slow.Close()
+			resolver, err := newWhoamiResolver(slow.URL, "test-secret")
+			if err != nil {
+				t.Fatalf("newWhoamiResolver: %v", err)
+			}
+			ch.resolver = resolver
+
+			start := time.Now()
+			got := awaitOpen(t, postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`))
+			if elapsed := time.Since(start); elapsed > wait+250*time.Millisecond {
+				t.Errorf("answered after %v, want within the wait of %v", elapsed, wait)
+			}
+			if got.status != http.StatusGatewayTimeout {
+				t.Errorf("status = %d, want 504", got.status)
+			}
+			select {
+			case <-inbox:
+				if !tc.reachesCore {
+					t.Error("a request without an identity reached the core")
+				}
+			default:
+				if tc.reachesCore {
+					t.Error("the request never reached the core")
+				}
+			}
+		})
+	}
+}
+
 // The core's answer never reaches a socket, even when it names a conversation
 // that has one; the session's own frames after it reach only that
 // conversation's sockets.
