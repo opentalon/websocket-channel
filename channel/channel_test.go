@@ -1617,6 +1617,29 @@ func TestReadLoop_spokenMessageAsksForASpokenReply(t *testing.T) {
 	}
 }
 
+// Only the server-side open call may store a note without a reply: a browser
+// frame that names note_reply still reaches core as an ordinary message.
+func TestReadLoop_frameCannotSetNoteReply(t *testing.T) {
+	_, inbox, srv, cleanup := testServerWithUsers(t, map[string]string{"tabA": "user1"})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _ := dialConvID(t, ctx, srv, "tabA", "frame-note-reply")
+	defer func() { _ = conn.CloseNow() }()
+
+	for _, value := range []any{"false", false} {
+		data, _ := json.Marshal(inboundFrame{Content: "Hallo", Metadata: map[string]any{"note_reply": value}})
+		if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		msg := recvInbox(t, ctx, inbox)
+		if got, ok := msg.Metadata["note_reply"]; ok {
+			t.Errorf("frame note_reply %#v reached core as %q", value, got)
+		}
+	}
+}
+
 // ── server-side open ──────────────────────────────────────────────────────────
 
 // openResult is the HTTP answer of one POST /ws/open; err is a transport or
@@ -1701,19 +1724,34 @@ func TestHandleOpen_answersOnceTheCoreCommitted(t *testing.T) {
 			body: `{"token":"sys-u1","opened_by":"setup","open_key":"k1","content":"facts","visibility":"hidden","reasoning_effort":"low"}`,
 			want: map[string]string{"profile_token": "sys-u1", "open_session": "true", "opened_by": "setup",
 				"open_key": "k1", "visibility": "hidden", "reasoning_effort": "low"},
-			absent:  []string{"session_id", "note_key"},
+			absent:  []string{"session_id", "note_key", "note_reply"},
 			created: true,
 		},
 		{
 			name:   "same key again",
 			body:   `{"token":"sys-u1","opened_by":"setup","open_key":"k1","content":"facts"}`,
 			want:   map[string]string{"open_session": "true", "opened_by": "setup", "open_key": "k1"},
-			absent: []string{"session_id", "note_key"},
+			absent: []string{"session_id", "note_key", "note_reply"},
 		},
 		{
 			name:    "continuation",
 			body:    `{"token":"sys-u1","session_id":"u1:websocket:c0","note_key":"n1","content":"note"}`,
 			want:    map[string]string{"open_session": "true", "session_id": "u1:websocket:c0", "note_key": "n1"},
+			absent:  []string{"opened_by", "open_key", "note_reply"},
+			created: true,
+		},
+		{
+			name:    "continuation with a reply",
+			body:    `{"token":"sys-u1","session_id":"u1:websocket:c0","note_key":"n2","content":"note","reply":true}`,
+			want:    map[string]string{"open_session": "true", "session_id": "u1:websocket:c0", "note_key": "n2"},
+			absent:  []string{"opened_by", "open_key", "note_reply"},
+			created: true,
+		},
+		{
+			name: "continuation without a reply",
+			body: `{"token":"sys-u1","session_id":"u1:websocket:c0","note_key":"n3","content":"note","reply":false}`,
+			want: map[string]string{"open_session": "true", "session_id": "u1:websocket:c0", "note_key": "n3",
+				"note_reply": "false"},
 			absent:  []string{"opened_by", "open_key"},
 			created: true,
 		},
@@ -1747,8 +1785,8 @@ func TestHandleOpen_answersOnceTheCoreCommitted(t *testing.T) {
 
 			session := "u1:websocket:" + msg.ConversationID
 			switch {
-			case tc.name == "continuation":
-				session = "u1:websocket:c0"
+			case tc.want["session_id"] != "":
+				session = tc.want["session_id"]
 			case !tc.created:
 				session = firstSession
 			default:
@@ -1819,6 +1857,14 @@ func TestHandleOpen_refusedBeforeTheCore(t *testing.T) {
 		{"no origin", http.MethodPost, `{"token":"sys-u1","open_key":"k","content":"x"}`, http.StatusBadRequest},
 		{"no key", http.MethodPost, `{"token":"sys-u1","opened_by":"a","content":"x"}`, http.StatusBadRequest},
 		{"continuation without note key", http.MethodPost, `{"token":"sys-u1","session_id":"u1:websocket:c","content":"x"}`, http.StatusBadRequest},
+		{"continuation reply null", http.MethodPost, `{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n","content":"x","reply":null}`, http.StatusBadRequest},
+		{"continuation reply string", http.MethodPost, `{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n","content":"x","reply":"false"}`, http.StatusBadRequest},
+		{"continuation reply number", http.MethodPost, `{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n","content":"x","reply":0}`, http.StatusBadRequest},
+		{"open reply null", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x","reply":null}`, http.StatusBadRequest},
+		{"open reply string", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x","reply":"true"}`, http.StatusBadRequest},
+		{"open reply number", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x","reply":1}`, http.StatusBadRequest},
+		{"open reply true", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x","reply":true}`, http.StatusBadRequest},
+		{"open reply false", http.MethodPost, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x","reply":false}`, http.StatusBadRequest},
 		{"malformed body", http.MethodPost, `{not json`, http.StatusBadRequest},
 		{"not a POST", http.MethodGet, ``, http.StatusMethodNotAllowed},
 	} {
@@ -1888,10 +1934,15 @@ func TestHandleOpen_noAnswerWithinTheWaitIs504(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	res := postOpen(t, srv, `{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`)
-	recvInbox(t, ctx, inbox) // the core takes the request and never answers
-	if got := awaitOpen(t, res); got.status != http.StatusGatewayTimeout {
-		t.Errorf("status = %d, want 504", got.status)
+	for _, body := range []string{
+		`{"token":"sys-u1","opened_by":"a","open_key":"k","content":"x"}`,
+		`{"token":"sys-u1","session_id":"u1:websocket:c","note_key":"n","content":"x","reply":false}`,
+	} {
+		res := postOpen(t, srv, body)
+		recvInbox(t, ctx, inbox) // the core takes the request and never answers
+		if got := awaitOpen(t, res); got.status != http.StatusGatewayTimeout {
+			t.Errorf("%s: status = %d, want 504", body, got.status)
+		}
 	}
 	ch.pending.Range(func(k, _ any) bool {
 		t.Errorf("request %v still waits after its answer", k)
