@@ -520,8 +520,6 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// noteReply is a continuation's optional reply switch, decoded from true or
-// false only.
 type noteReply struct {
 	set   bool
 	value bool
@@ -540,9 +538,8 @@ func (r *noteReply) UnmarshalJSON(data []byte) error {
 // continues one with a hidden note, and answers with the session the core
 // committed. A backend POSTs {token, opened_by, open_key, content} to open, or
 // {token, session_id, note_key, content, reply} to continue; visibility and
-// reasoning_effort are forwarded like on /inject, and reply false reaches the
-// core as note_reply. Only a system token may do this, so a browser token never
-// reaches the core with the open metadata.
+// reasoning_effort are forwarded like on /inject. Only a system token may do
+// this, so a browser token never reaches the core with the open metadata.
 //
 // The request reaches the core under a minted conversation id (a session it
 // opens is "<user>:websocket:<conversation>") and a correlation id of its own,
