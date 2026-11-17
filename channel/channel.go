@@ -38,6 +38,7 @@ const (
 	openKeyMetadataKey       = "open_key"
 	openSessionIDMetadataKey = "session_id"
 	noteKeyMetadataKey       = "note_key"
+	noteReplyMetadataKey     = "note_reply"
 	openRequestIDMetadataKey = "open_request_id"
 
 	frameSessionOpened = "session_opened"
@@ -519,10 +520,24 @@ func (c *Channel) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type noteReply struct {
+	set   bool
+	value bool
+}
+
+func (r *noteReply) UnmarshalJSON(data []byte) error {
+	switch string(data) {
+	case "true", "false":
+		*r = noteReply{set: true, value: string(data) == "true"}
+		return nil
+	}
+	return fmt.Errorf("reply must be true or false, got %s", data)
+}
+
 // handleOpen opens a chat session for a user on a trusted backend's request, or
 // continues one with a hidden note, and answers with the session the core
 // committed. A backend POSTs {token, opened_by, open_key, content} to open, or
-// {token, session_id, note_key, content} to continue; visibility and
+// {token, session_id, note_key, content, reply} to continue; visibility and
 // reasoning_effort are forwarded like on /inject. Only a system token may do
 // this, so a browser token never reaches the core with the open metadata.
 //
@@ -555,14 +570,15 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Token           string `json:"token"`
-		OpenedBy        string `json:"opened_by"`
-		OpenKey         string `json:"open_key"`
-		SessionID       string `json:"session_id"`
-		NoteKey         string `json:"note_key"`
-		Content         string `json:"content"`
-		Visibility      string `json:"visibility"`
-		ReasoningEffort string `json:"reasoning_effort"`
+		Token           string    `json:"token"`
+		OpenedBy        string    `json:"opened_by"`
+		OpenKey         string    `json:"open_key"`
+		SessionID       string    `json:"session_id"`
+		NoteKey         string    `json:"note_key"`
+		Content         string    `json:"content"`
+		Visibility      string    `json:"visibility"`
+		ReasoningEffort string    `json:"reasoning_effort"`
+		Reply           noteReply `json:"reply"`
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
 	if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -585,6 +601,10 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 	}
 	if !complete {
 		http.Error(w, "token, content and either opened_by and open_key or session_id and note_key are required", http.StatusBadRequest)
+		return
+	}
+	if body.SessionID == "" && body.Reply.set {
+		http.Error(w, "reply is only for a continuation with session_id and note_key", http.StatusBadRequest)
 		return
 	}
 
@@ -619,6 +639,9 @@ func (c *Channel) handleOpen(w http.ResponseWriter, r *http.Request) {
 	if body.SessionID != "" {
 		meta[openSessionIDMetadataKey] = body.SessionID
 		meta[noteKeyMetadataKey] = body.NoteKey
+		if body.Reply.set && !body.Reply.value {
+			meta[noteReplyMetadataKey] = "false"
+		}
 	} else {
 		meta[openedByMetadataKey] = body.OpenedBy
 		meta[openKeyMetadataKey] = body.OpenKey

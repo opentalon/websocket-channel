@@ -139,27 +139,45 @@ system token (WhoAmI `kind: "system"`) may call it.
 }
 ```
 
-To continue such a session, send `session_id` (from an earlier answer) and
-`note_key` instead of `opened_by` and `open_key`: the content becomes a hidden
-note in that session, stored and answered once per note key. `visibility` and
-`reasoning_effort` are optional and passed to the core as on `/inject`; the
-content is hidden either way.
+To continue a session, send `session_id` and `note_key` instead of `opened_by`
+and `open_key`: the content becomes a hidden note in that session, stored once
+per note key. The session is one this call opened (the `session_id` of an
+earlier answer) or any conversation of the token's user and account on this
+channel whose owner the core verified at a message of the user's own.
+`visibility` and `reasoning_effort` are optional and passed to the core as on
+`/inject`; the content is hidden either way.
+
+```json
+{
+  "token": "<system profile_token>",
+  "session_id": "<user>:websocket:<conversation>",
+  "note_key": "<key, unique within the session>",
+  "content": "<hidden note>",
+  "reply": false
+}
+```
+
+`reply` is optional and belongs to a continuation only. With `true`, the
+default, the assistant answers the note into the conversation. With `false`
+the note is only stored, for the assistant's later turns: no answer and nothing
+sent to the conversation's sockets.
 
 Returns `200 {"session_id": "<user>:websocket:<conversation>", "created": true}`
 only after the core committed the session. `created` is `false` when the same
 user, origin and key found the existing session (its first turn never runs
-twice) or the note key was already stored.
+twice) or the note key was already stored. For a note without a reply, `200`
+means the note is stored, whatever `created` says.
 
 | Status | Meaning |
 |---|---|
-| `400` | bad body or missing field |
+| `400` | bad body or missing field; a `reply` that is neither `true` nor `false` (`null` included); any `reply` on the opening form |
 | `401` | unresolvable token |
 | `403` | not a system token |
-| `404` | the session to continue does not exist or belongs to another user |
+| `404` | the session to continue does not exist or is out of reach: another user or account, another channel, or no owner the core verified |
 | `405` | non-POST |
 | `502` | the core failed; retry with the same key |
 | `503` | the core did not take the request; retry with the same key |
-| `504` | no answer within 10 seconds of the request, identity lookup included; retry with the same key |
+| `504` | no answer within 10 seconds of the request, identity lookup included; retry with the same key. For a note without a reply: not stored within the wait, because a turn was running or another call held the key; the core stores it if its place among the session's turns comes within three minutes, and the same call again stores it or answers `200` |
 
 The assistant's reply goes to the session's conversation like any reply: to
 the sockets that hold it, never to another conversation's or another user's. A
